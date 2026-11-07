@@ -1,4 +1,4 @@
-/* GFC Ops CRM — design system inspired by the soft pastel dashboard reference */
+
 :root{
   --bg:#f8edd6; --frame:#ffffff; --panel:#f5f3ee; --card:#ffffff;
   --ink:#141414; --ink2:#3c3c3c; --muted:#8a8a8a; --line:#e7e7e5; --line2:#d9d9d6;
@@ -40,7 +40,7 @@ h1,h2,h3,h4{margin:0;font-weight:600;letter-spacing:-.01em}
 .side-foot{display:flex;flex-direction:column;align-items:center;gap:4px;font-size:10px;color:var(--muted)}
 .main{flex:1;min-width:0;background:var(--panel);margin:14px 14px 14px 0;border-radius:var(--r-lg);overflow:auto;padding:28px 32px 48px;scroll-behavior:auto}
 
-/* Top bar */
+
 .topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:22px;flex-wrap:wrap}
 .topbar h1{font-size:30px}
 .topbar .sub{margin:4px 0 0;color:var(--muted);font-size:13px}
