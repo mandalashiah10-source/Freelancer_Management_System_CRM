@@ -1,5 +1,8 @@
 'use strict';
-
+/* ===== Spreadsheet import into one freelancer's table: Upload → Map → Review → Done =====
+   Reads .xlsx/.xls (SheetJS) and .csv, detects the header row, auto-maps columns,
+   normalises values and flags errors/duplicates. New rows are added; existing rows
+   are only overwritten when the user picks "Update" and confirms. */
 
 const IMPORT_FIELDS = [
   { k: 'assignDate', label: 'Assignment Date', req: true }, { k: 'deliveryDate', label: 'Delivery Date' },
@@ -13,7 +16,7 @@ const ALIASES = {
   client: ['client', 'client name', 'brand', 'brand name', 'account', 'customer', 'project'],
   type: ['type', 'deliverable type', 'format', 'content type', 'category', 'deliverable', 'work type', 'creative type'],
   subject: ['subject', 'topic', 'title', 'description', 'task', 'brief', 'content', 'concept', 'details', 'work'],
-  status: ['status', 'task status', 'approval status', 'stage', 'progress', 'approval'],
+  status: ['status', 'client status', 'task status', 'work status', 'approval status', 'stage', 'progress', 'approval'],
   paymentStatus: ['payment status', 'payment', 'paid', 'paid unpaid', 'payment state', 'payout', 'payout status'],
   link: ['posting link', 'link', 'url', 'post link', 'published link', 'live link', 'drive link', 'final link', 'posted link'],
   notes: ['notes', 'note', 'remarks', 'comments', 'instructions', 'remark', 'feedback', 'comment'],
@@ -41,6 +44,16 @@ function parseCSV(text) {
 const MON = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, sept: 9, oct: 10, nov: 11, dec: 12, january: 1, february: 2, march: 3, april: 4, june: 6, july: 7, august: 8, september: 9, october: 10, november: 11, december: 12 };
 function validYMD(y, m, d) { if (y < 100) y += 2000; const dt = new Date(y, m - 1, d); return dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d ? isoOf(dt) : null; }
 /** returns {iso, warn} or {err} or null for blank */
+/** For a whole sheet: if any date reads like 10/28 it is month/day; if any like 28/10 it is day/month. */
+function inferDateFmt(vals, monthHint) {
+  let dmy = 0, mdy = 0;
+  for (const v of vals) {
+    const m = typeof v === 'string' && v.trim().match(/^(\d{1,2})[-/.](\d{1,2})(?:[-/.](\d{2,4}))?$/); if (!m) continue;
+    if (+m[1] > 12) dmy++; else if (+m[2] > 12) mdy++;
+    else if (monthHint && +m[1] !== +m[2]) { if (+m[1] === monthHint) mdy++; else if (+m[2] === monthHint) dmy++; }   // a tab called “Oct” holds 10/x (month first) or x/10 (day first)
+  }
+  return mdy > dmy ? 'mdy' : dmy > mdy ? 'dmy' : 'auto';
+}
 function parseDateVal(v, fmt) {
   if (v === null || v === undefined || String(v).trim() === '') return null;
   if (v instanceof Date && !isNaN(v)) return { iso: isoOf(v) };
@@ -85,6 +98,7 @@ function normStatus(v) {
   const exact = STATUSES.find(t => normKey(t) === n); if (exact) return { val: exact };
   if (/reject|cancel|scrap|drop|declin/.test(n)) return { val: 'Rejected' };
   if (/change|revision|rework|correction|redo|modif/.test(n)) return { val: 'In Changes' };
+  if (/\bmade\b|created|ready/.test(n)) return { val: 'In Review' };
   if (/review|submitted|sent|feedback|awaiting|pending approval/.test(n)) return { val: 'In Review' };
   if (/approv|done|complete|final|posted|published|live|delivered|ok/.test(n)) return { val: 'Approved' };
   if (/allot|assign|new|todo|to do|wip|progress|working|pending|not started|open/.test(n)) return { val: 'Allotted' };
@@ -221,16 +235,21 @@ const Importer = {
     const existing = new Map();
     DB.d.deliverables.filter(d => d.freelancerId === S.fid).forEach(d => existing.set(dupKey(d.assignDate, d.client, d.type, d.subject), d));
     const seen = new Map();
+    const dateCells = []; S.sheets.forEach(sh => { if (sh.include) sh.rows.forEach((r, ri) => { if (ri > sh.headerIdx) for (const k of ['assignDate', 'deliveryDate']) if (sh.map[k] >= 0) dateCells.push(r[sh.map[k]]); }); });
+    const gfmt = o.dateFmt === 'auto' ? inferDateFmt(dateCells) : o.dateFmt;
     for (const sh of S.sheets) {
       if (!sh.include) continue;
+      const cells = sh.rows.filter((r, ri) => ri > sh.headerIdx).flatMap(r => ['assignDate', 'deliveryDate'].filter(k => sh.map[k] >= 0).map(k => r[sh.map[k]]));
+      const hint = MON[String(sh.name).trim().toLowerCase().slice(0, 3)] || 0;
+      const local = o.dateFmt === 'auto' ? inferDateFmt(cells, hint) : o.dateFmt, fmt = local !== 'auto' ? local : gfmt;
       sh.rows.forEach((r, ri) => {
         if (ri <= sh.headerIdx || !r.some(c => String(c).trim() !== '')) return;
         const get = k => sh.map[k] >= 0 ? r[sh.map[k]] : '';
         const rec = { sheet: sh.name, row: ri + 1, errors: [], warnings: [], data: {}, include: true, kind: 'new' };
         const D = rec.data;
-        const ad = parseDateVal(get('assignDate'), o.dateFmt);
+        const ad = parseDateVal(get('assignDate'), fmt);
         if (!ad) rec.errors.push('Missing assignment date'); else if (ad.err || !ad.iso) rec.errors.push(ad.err || 'Invalid assignment date'); else { D.assignDate = ad.iso; if (ad.warn) rec.warnings.push('Assignment date ' + ad.warn); }
-        const dd = parseDateVal(get('deliveryDate'), o.dateFmt);
+        const dd = parseDateVal(get('deliveryDate'), fmt);
         if (dd?.err || (dd && !dd.iso)) rec.warnings.push((dd.err || 'Invalid delivery date') + ' — left blank');
         else if (dd) { D.deliveryDate = dd.iso; if (dd.warn) rec.warnings.push('Delivery date ' + dd.warn); if (D.assignDate && dd.iso < D.assignDate) { rec.warnings.push('Delivery before assignment date — left blank'); D.deliveryDate = ''; } }
         D.client = String(get('client') ?? '').trim().replace(/\s+/g, ' ');
@@ -392,7 +411,7 @@ const Importer = {
       on('#impUndo', 'click', async () => {
         const keep = this.s;
         if (!await confirmDialog({ title: 'Undo added rows?', body: `Removes the ${keep.result.added} deliverables just added. ${keep.result.updated ? 'Updated rows keep their new values.' : ''}`, confirmText: 'Undo', danger: true })) { openModal('', { size: 'wide' }); this.s = keep; this.render(); return; }
-        const n = DB.undoImport(keep.result.batch); toast(`${n} imported rows removed`); rerender();
+        const n = await DB.undoImport(keep.result.batch, keep.fid); toast(`${n} imported rows removed`); rerender();
       });
     }
   },
