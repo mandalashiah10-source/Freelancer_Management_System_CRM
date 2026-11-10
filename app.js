@@ -85,39 +85,59 @@ function confirmDialog({ title, body = '', confirmText = 'Confirm', danger = fal
 }
 
 async function saveFile(name, data) {
-  const dl = window.claude?.use ? await window.claude.use('downloads') : null;
-  if (!dl) return toast('Downloads aren’t available in this view. Open the CRM on claude.ai to download files.', 'error');
-  try { await dl.save({ filename: name, data }); toast(`Downloaded ${name}`); }
-  catch (e) { if (e?.code !== 'declined') toast(`Couldn’t download the file (${e?.message || e?.code || 'unknown error'}).`, 'error'); }
+  try {
+    const blob = new Blob([data], { type: /\.csv$/i.test(name) ? 'text/csv;charset=utf-8' : 'application/octet-stream' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1500); toast(`Downloaded ${name}`);
+  } catch (e) { toast(`Couldn’t download the file (${e?.message || 'unknown error'}).`, 'error'); }
 }
 const download = (name, content) => saveFile(name, content);
 const csvCell = v => { const s = String(v ?? ''); return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
 const toCSV = rows => rows.map(r => r.map(csvCell).join(',')).join('\r\n');
 
 /* ---------- UI state ---------- */
-const ui = { flQ: '', ws: {}, pending: false, onModalClose: null };
+const ui = { flQ: '', teamQ: '', flView: '', ws: {}, pending: false, onModalClose: null };
 const wsState = id => ui.ws[id] || (ui.ws[id] = { tab: 'deliverables', ym: ymOf(todayISO()), q: '', sort: { k: 'assignDate', dir: -1 } });
 
 /* ---------- shell ---------- */
 const LOGO = window.GFC_LOGO || 'gfc-logo.png';
 const NAV = [['freelancers', 'Freelancer', 'users'], ['settings', 'Settings', 'gear']];
+const NAV_F = [['me', 'My work', 'file'], ['team', 'Team', 'users']];
 function renderSidebar(page) {
   $('#sidebar').innerHTML = `<a class="logo" href="#/freelancers" title="Goodfellow Consultancy"><img src="${LOGO}" alt="GFC" class="logo-img"></a>
-    <nav class="nav">${NAV.map(([k, l, i]) => `<a href="#/${k}" class="${page === k ? 'active' : ''}" title="${l}"><span class="ic">${ic(i)}</span><span class="lbl">${l}</span></a>`).join('')}</nav>
-    <div class="sync off" id="sync" aria-live="polite">Connecting…</div>`;
+    <nav class="nav">${(DB.role === 'owner' ? NAV : DB.role === 'freelancer' && DB.myId && DB.freelancer(DB.myId) ? NAV_F : []).map(([k, l, i]) => `<a href="#/${k}" class="${page === k ? 'active' : ''}" title="${l}"><span class="ic">${ic(i)}</span><span class="lbl">${l}</span></a>`).join('')}</nav>
+    <div class="sync off" id="sync" aria-live="polite">Connecting…</div>${DB.user ? `<button class="signout" data-act="sign-out" title="Signed in as ${esc(DB.user.email || '')}">Sign out</button>` : ''}`;
 }
 function route() {
+  if (DB.role === 'freelancer') {
+    const [pg, tid] = location.hash.replace(/^#\/?/, '').split('/'), me = DB.myId && DB.freelancer(DB.myId);
+    const page = pg === 'team' && me ? 'team' : 'me'; renderSidebar(page); const main = $('#main');
+    if (!DB.loaded) { main.innerHTML = stateScreen(); DB.onStatus(); return; }
+    let html, after = null;
+    if (!me) html = `<div class="empty card" style="margin:12vh auto 0;max-width:520px"><img src="${LOGO}" alt="" style="width:64px;height:64px;border-radius:18px;margin-bottom:14px"><div class="big">You’re not on the team yet</div>You’re signed in as <b>${esc(DB.user?.email || '')}</b>, but the owner hasn’t added this email to a profile. Ask the GFC owner to add exactly this email, then reload.</div>`;
+    else if (page === 'team') { const p = tid && tid !== me.id && DB.d.team.find(x => x.id === tid); html = p ? viewTeamProfile(p) : viewTeam(); if (p) after = () => wsRefresh(p.id); }
+    else { html = viewWorkspace(me.id); after = () => wsRefresh(me.id); }
+    main.innerHTML = html; DB.onStatus(); if (after) after(); return;
+  }
   const [page, id] = location.hash.replace(/^#\/?/, '').split('/');
   if (page !== 'freelancers' && page !== 'settings') { location.replace('#/freelancers'); return; }
   renderSidebar(page);
   const main = $('#main');
   if (!DB.loaded) { main.innerHTML = stateScreen(); DB.onStatus(); return; }
   main.innerHTML = page === 'settings' ? viewSettings() : id ? viewWorkspace(id) : viewFreelancers();
+  if (page === 'settings') refreshAdmins();
   DB.onStatus();
   main.scrollTop = 0;
   if (id && page === 'freelancers') wsRefresh(id);
 }
 function stateScreen() {
+  const card = inner => `<div class="empty card login" style="margin:10vh auto 0;max-width:420px"><img src="${LOGO}" alt="" style="width:64px;height:64px;border-radius:18px;margin-bottom:14px">${inner}</div>`;
+  if (DB.state === 'login') return card(`<div class="big">GFC CRM</div><p class="muted" style="margin:0 0 14px">Sign in with your email</p>
+    <input class="inp" id="authEmail" type="email" placeholder="Email" autocomplete="username"><input class="inp" id="authPw" type="password" placeholder="Password" autocomplete="current-password">
+    <div class="auth-msg" id="authMsg" role="alert"></div><button class="btn dark lg" data-act="auth-in" style="width:100%">Sign in</button>
+    <div class="auth-links"><button class="link" data-act="auth-up">First time? Create account</button><button class="link" data-act="auth-reset">Forgot password?</button></div>`);
+  if (DB.state === 'recovery') return card(`<div class="big">Choose a new password</div><input class="inp" id="authPw" type="password" placeholder="New password (8+ characters)" autocomplete="new-password"><div class="auth-msg" id="authMsg" role="alert"></div><button class="btn dark lg" data-act="auth-newpw" style="width:100%">Save password</button>`);
+  if (DB.state === 'setup') return card(`<div class="big">Almost ready</div>This site isn’t connected to its database yet. Open <b>config.js</b> and paste your Supabase project URL and anon key (see SETUP.md).`);
   const m = {
     loading: ['Loading your workspace…', 'Fetching freelancers and deliverables.'],
     slow: ['Still connecting…', 'The database can’t be reached yet. Check your internet connection; this page keeps trying on its own.'],
@@ -134,19 +154,25 @@ function rerender() {
 }
 
 /* ================= FREELANCERS ================= */
+const flMode = () => ui.flView || (DB.d.freelancers.length > 12 ? 'list' : 'cards');
+const modeToggle = m => `<div class="seg" role="group" aria-label="View"><button class="${m === 'cards' ? 'on' : ''}" data-act="fl-view" data-v="cards">Cards</button><button class="${m === 'list' ? 'on' : ''}" data-act="fl-view" data-v="list">List</button></div>`;
 function viewFreelancers() {
+  const m = flMode();
   return `<header class="topbar"><div><h1>Freelancers</h1><p class="sub">${DB.d.freelancers.length} freelancer${DB.d.freelancers.length === 1 ? '' : 's'}</p></div>
-    <div class="top-right"><label class="search">${ic('search', 18)}<input data-on="fl-q" placeholder="Search freelancers by name" value="${esc(ui.flQ)}" aria-label="Search freelancers"></label>
+    <div class="top-right"><label class="search">${ic('search', 18)}<input data-on="fl-q" placeholder="Search by name, role or email" value="${esc(ui.flQ)}" aria-label="Search freelancers"></label>${modeToggle(m)}
     <button class="btn dark" data-act="fl-add">${ic('plus', 16)} Add Freelancer</button></div></header>
-  <div class="fl-grid" id="flGrid">${flGrid()}</div>`;
+  <div class="${m === 'list' ? 'fl-list' : 'fl-grid'}" id="flGrid">${flGrid()}</div>`;
 }
 function flGrid() {
-  const q = ui.flQ.trim().toLowerCase();
-  const list = DB.d.freelancers.filter(f => !q || f.name.toLowerCase().includes(q)).sort((a, b) => a.name.localeCompare(b.name));
-  if (!list.length) return `<div class="empty card" style="grid-column:1/-1"><div class="big">${DB.d.freelancers.length ? 'No freelancer matches that name' : 'No freelancers yet'}</div>${DB.d.freelancers.length ? 'Try a different search.' : 'Click “Add Freelancer” to create the first profile.'}</div>`;
+  const q = ui.flQ.trim().toLowerCase(), m = flMode();
+  const list = DB.d.freelancers.filter(f => !q || [f.name, f.description, f.email].join(' ').toLowerCase().includes(q)).sort((a, b) => a.name.localeCompare(b.name));
+  if (!list.length) return `<div class="empty card" style="grid-column:1/-1"><div class="big">${DB.d.freelancers.length ? 'No freelancer matches that search' : 'No freelancers yet'}</div>${DB.d.freelancers.length ? 'Try a different search.' : 'Click “Add Freelancer” to create the first profile.'}</div>`;
+  const tag = f => `<span class="lnk-tag ${f.linked ? 'on' : ''}">${f.linked ? 'Signed up' : f.email ? 'Invite pending' : 'No login'}</span>`;
+  const tools = f => `<div class="fl-tools"><button class="icon-btn xs" data-act="fl-edit" data-id="${f.id}" title="Edit">${ic('edit', 15)}</button><button class="icon-btn xs danger" data-act="fl-del" data-id="${f.id}" title="Delete">${ic('trash', 15)}</button></div>`;
+  if (m === 'list') return list.map(f => `<article class="fl-row" data-act="fl-open" data-id="${f.id}" tabindex="0" aria-label="Open ${esc(f.name)}">${avatar(f, 40)}<b class="c-name">${esc(f.name)}</b><span class="c-role">${esc(f.description || 'Freelancer')}</span><span class="c-mail">${esc(f.email || '')}</span>${tag(f)}${tools(f)}</article>`).join('');
   return list.map(f => `<article class="fl-card profile tone-${TONES[hashStr(f.id) % TONES.length]}" data-act="fl-open" data-id="${f.id}" tabindex="0" aria-label="Open ${esc(f.name)}">
-      <div class="fl-tools"><button class="icon-btn xs" data-act="fl-edit" data-id="${f.id}" title="Edit">${ic('edit', 15)}</button><button class="icon-btn xs danger" data-act="fl-del" data-id="${f.id}" title="Delete">${ic('trash', 15)}</button></div>
-      ${avatar(f, 88)}<h3>${esc(f.name)}</h3><p class="role">${esc(f.description || 'Freelancer')}</p></article>`).join('');
+      ${tools(f)}
+      ${avatar(f, 88)}<h3>${esc(f.name)}</h3><p class="role">${esc(f.description || 'Freelancer')}</p>${tag(f)}</article>`).join('');
 }
 
 function openFreelancerModal(id) {
@@ -159,6 +185,9 @@ function openFreelancerModal(id) {
     <label>Name<input name="name" value="${esc(f?.name || '')}" required placeholder="e.g. Rahul Sharma"></label>
     <label>Description / role<input name="description" value="${esc(f?.description || '')}" placeholder="e.g. Video Editor | Freelancer" list="roleList"></label>
     <datalist id="roleList"><option value="Video Editor | Freelancer"><option value="Graphic Designer | Freelancer"></datalist>
+    ${f ? '' : `<div class="rate-new"><b>Their rates (${esc(DB.S.currency)} per deliverable)</b><p class="hint" style="margin:2px 0 10px">Optional. You can set or change these later in the Rates tab.</p><div class="rate-grid" id="newRates">${DB.types().map(t => `<label class="rate-item"><span>${esc(t)}</span><div class="money-in"><i>${esc(DB.S.currency)}</i><input type="number" min="0" step="1" data-type="${esc(t)}" placeholder="—" aria-label="${esc(t)} rate"></div></label>`).join('')}</div></div>`}
+    <label>Login email<input name="email" type="email" value="${esc(f?.email || '')}" placeholder="their email, used to sign in" ${f?.linked ? 'readonly' : ''}></label>
+    <p class="hint" style="margin:-4px 0 6px">${f?.linked ? 'This freelancer has signed up and can see their own work and rates.' : 'They create an account on the site with this exact email and are connected automatically. Leave blank if they won’t log in.'}</p>
   </form></div><div class="m-foot"><button class="btn" data-act="modal-close">Cancel</button><button class="btn dark" id="fSave">${f ? 'Save' : 'Add freelancer'}</button></div>`, { size: 'sm' });
   const form = $('#fform', m);
   const prev = () => { $('#avPrev', m).innerHTML = avatar({ id: f?.id, name: form.elements.name.value || '?', avatar: avatarData }, 72); };
@@ -166,8 +195,8 @@ function openFreelancerModal(id) {
   $('#avFile', m).onchange = async e => { const file = e.target.files[0]; if (!file) return; try { avatarData = await fileToAvatar(file); prev(); } catch { toast('Could not read that image', 'error'); } };
   $('#avRm', m).onclick = () => { avatarData = ''; prev(); };
   $('#fSave', m).onclick = () => {
-    const data = { name: form.elements.name.value.trim(), description: form.elements.description.value.trim(), avatar: avatarData };
-    try { f ? DB.updateFreelancer(f.id, data) : DB.addFreelancer(data); } catch (e) { return toast(e.message, 'error'); }
+    const data = { name: form.elements.name.value.trim(), description: form.elements.description.value.trim(), avatar: avatarData, email: form.elements.email.value.trim() };
+    try { f ? DB.updateFreelancer(f.id, data) : DB.addFreelancer({ ...data, rates: Object.fromEntries($$('#newRates input', m).map(i => [i.dataset.type, i.value])) }); } catch (e) { return toast(e.message, 'error'); }
     closeModal(); toast(f ? 'Saved' : `${data.name} added`); rerender();
   };
   form.addEventListener('submit', e => { e.preventDefault(); $('#fSave', m).click(); });
@@ -189,9 +218,9 @@ async function deleteFreelancer(id) {
 /* ================= WORKSPACE ================= */
 function periodSelectors(ym, attrs) {
   const [y, m] = ym ? ym.split('-') : ['', ''];
-  const years = new Set([new Date().getFullYear()]); DB.d.deliverables.forEach(d => d.assignDate && years.add(+d.assignDate.slice(0, 4)));
+  const years = new Set(); for (let v = 2025; v <= 2050; v++) years.add(v);
   return `<select class="fsel" ${attrs} data-k="m" aria-label="Month">${opt('', 'All months', m || '')}${MONTHS.map((n, i) => opt(pad(i + 1), n, m || '')).join('')}</select>
-    <select class="fsel" ${attrs} data-k="y" aria-label="Year">${opt('', 'All years', y || '')}${[...years].sort((a, b) => b - a).map(v => opt(v, v, y)).join('')}</select>`;
+    <select class="fsel" ${attrs} data-k="y" aria-label="Year">${opt('', 'All years', y || '')}${[...years].sort((a, b) => a - b).map(v => opt(v, v, y)).join('')}</select>`;
 }
 const periodFrom = (y, m) => y ? (m ? `${y}-${m}` : `${y}`) : '';
 const periodLabel = ym => !ym ? 'All time' : ym.length === 4 ? ym : monthLabel(ym);
@@ -205,13 +234,44 @@ function viewWorkspace(id) {
       <label class="search sm" style="background:#fff">${ic('search', 16)}<input data-on="ws-q" data-id="${id}" placeholder="Search this table" value="${esc(s.q)}" aria-label="Search deliverables"></label></div>
     <div class="kpi-row" id="wsSum" style="margin-bottom:14px"></div>
     <section class="card" id="wsTable"></section>`;
-  return `<a class="back" href="#/freelancers">${ic('left', 16)} Freelancers</a>
+  const ro = DB.role === 'freelancer';
+  return `${ro ? '' : `<a class="back" href="#/freelancers">${ic('left', 16)} Freelancers</a>`}
   <section class="ws-head tone-${tone}">${avatar(f, 84)}<div class="ws-id"><h2>${esc(f.name)}</h2><div class="ws-meta">${esc(f.description || 'Freelancer')}</div></div>
-    <div class="btn-row"><button class="btn" data-act="fl-edit" data-id="${f.id}">${ic('edit', 16)} Edit</button>
-    <button class="btn" data-act="import-open" data-id="${f.id}">${ic('upload', 16)} Import</button><button class="btn" data-act="download-open" data-id="${f.id}">${ic('download', 16)} Download</button>
-    <button class="btn dark lg" data-act="add-deliverable" data-id="${f.id}">${ic('plus', 18)} Add Deliverable</button></div></section>
+    <div class="btn-row">${ro ? '' : `<button class="btn" data-act="fl-edit" data-id="${f.id}">${ic('edit', 16)} Edit</button>
+    <button class="btn" data-act="import-open" data-id="${f.id}">${ic('upload', 16)} Import</button>`}<button class="btn" data-act="download-open" data-id="${f.id}">${ic('download', 16)} Download</button>
+    ${ro ? '' : `<button class="btn dark lg" data-act="add-deliverable" data-id="${f.id}">${ic('plus', 18)} Add Deliverable</button>`}</div></section>
   <div class="tabs">${[['deliverables', 'Deliverables'], ['rates', 'Rates']].map(([k, l]) => `<button class="${s.tab === k ? 'on' : ''}" data-act="ws-tab" data-id="${id}" data-tab="${k}">${l}</button>`).join('')}</div>
   ${body}`;
+}
+function teamGrid() {
+  const q = ui.teamQ.trim().toLowerCase(), list = DB.d.team.filter(p => p.id !== DB.myId && (!q || [p.name, p.description].join(' ').toLowerCase().includes(q))).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  if (!list.length) return `<div class="empty card" style="grid-column:1/-1"><div class="big">${q ? 'No one matches that search' : 'No one else yet'}</div></div>`;
+  if (DB.d.team.length > 13) return list.map(p => `<article class="fl-row team" data-act="team-open" data-id="${esc(p.id)}" tabindex="0" aria-label="Open ${esc(p.name)}">${avatar(p, 40)}<b class="c-name">${esc(p.name)}</b><span class="c-role">${esc(p.description || 'Freelancer')}</span></article>`).join('');
+  return list.map(p => `<article class="fl-card profile tone-${TONES[hashStr(p.id) % TONES.length]}" data-act="team-open" data-id="${esc(p.id)}" tabindex="0" aria-label="Open ${esc(p.name)}">${avatar(p, 88)}<h3>${esc(p.name)}</h3><p class="role">${esc(p.description || 'Freelancer')}</p></article>`).join('');
+}
+function viewTeam() {
+  return `<header class="topbar"><div><h1>Team</h1><p class="sub">See what everyone is working on. Rates and amounts are private.</p></div>
+    <div class="top-right"><label class="search">${ic('search', 18)}<input data-on="team-q" placeholder="Search by name or role" value="${esc(ui.teamQ)}" aria-label="Search team"></label></div></header>
+  <div class="${DB.d.team.length > 13 ? 'fl-list' : 'fl-grid'}" id="teamGrid">${teamGrid()}</div>`;
+}
+function viewTeamProfile(p) {
+  const s = wsState(p.id), tone = TONES[hashStr(p.id) % TONES.length], id = esc(p.id);
+  return `<a class="back" href="#/team">${ic('left', 16)} Team</a>
+  <section class="ws-head tone-${tone}">${avatar(p, 84)}<div class="ws-id"><h2>${esc(p.name)}</h2><div class="ws-meta">${esc(p.description || 'Freelancer')}</div></div></section>
+  <div class="toolbar"><span class="chip" style="background:#fff;height:38px;padding:0 12px">${ic('calendar', 15)}</span>${periodSelectors(s.ym, `data-on="ws-period" data-id="${id}"`)}
+    <label class="search sm" style="background:#fff">${ic('search', 16)}<input data-on="ws-q" data-id="${id}" placeholder="Search" value="${esc(s.q)}" aria-label="Search work"></label></div>
+  <section class="card" id="wsTable"></section>`;
+}
+const teamRow = d => { const url = safeUrl(d.link); return `<tr><td class="c-date">${fmtDateY(d.assignDate)}</td><td class="c-date">${fmtDateY(d.deliveryDate)}</td><td class="c-client">${d.client ? `<span class="pill tint tint-${tintOf('c', d.client)}">${esc(d.client)}</span>` : '—'}</td><td class="c-type"><span class="pill tint tint-${tintOf('t', d.type)}">${esc(d.type)}</span></td><td class="c-subject">${esc(d.subject)}</td><td><span class="pill st-${slug(d.status)}">${esc(d.status)}</span></td><td>${url ? `<a class="open-link" href="${esc(url)}" target="_blank" rel="noopener noreferrer">Open ${ic('arrow', 14)}</a>` : '—'}</td></tr>`; };
+function teamRefresh(id) {
+  const box = $('#wsTable'); if (!box) return;
+  const s = wsState(id), q = s.q.trim().toLowerCase(), dir = s.sort.dir, k = ['assignDate', 'deliveryDate', 'client', 'type', 'subject', 'status'].includes(s.sort.k) ? s.sort.k : 'assignDate';
+  DB.watchWork(id, s.ym);
+  const val = d => k === 'status' ? STATUSES.indexOf(d.status) : String(d[k] || '').toLowerCase();
+  const rows = DB.d.work.filter(d => !q || [d.subject, d.client, d.type, d.status].join(' ').toLowerCase().includes(q)).sort((a, b) => { const x = val(a), y = val(b); return ((x > y) - (x < y)) * dir || b.createdAt - a.createdAt; });
+  const th = (key, l) => `<th class="sort" data-act="ws-sort" data-id="${esc(id)}" data-k="${key}">${l}${k === key ? `<span class="arr">${dir > 0 ? '↑' : '↓'}</span>` : ''}</th>`;
+  box.innerHTML = rows.length ? `<div class="table-scroll"><table class="sheet"><thead><tr>${th('assignDate', 'Assignment date')}${th('deliveryDate', 'Delivery date')}${th('client', 'Client')}${th('type', 'Type')}${th('subject', 'Subject')}${th('status', 'Status')}<th>Posting link</th></tr></thead><tbody>${rows.slice(0, 300).map(teamRow).join('')}</tbody></table></div><div class="dt-foot"><span class="muted">${rows.length} row${rows.length === 1 ? '' : 's'} · ${periodLabel(s.ym)}</span></div>`
+    : `<div class="empty"><div class="big">${DB.workLoading ? 'Loading…' : 'Nothing in ' + periodLabel(s.ym)}</div></div>`;
 }
 function wsRows(id) {
   const s = wsState(id), q = s.q.trim().toLowerCase();
@@ -227,24 +287,36 @@ function wsSummaryHtml(id) {
   return t('Deliverables', r.count, 'white', periodLabel(s.ym)) + t('Total amount', money(r.total), 'cream', rule) + t('Paid', money(r.paid), 'mint') + t('Unpaid', money(r.unpaid), 'pink');
 }
 function wsRefresh(id) {
+  if (DB.role === 'freelancer' && id !== DB.myId) return teamRefresh(id);
   const box = $('#wsTable'); if (!box) return;
+  DB.watch(id, wsState(id).ym);
   $('#wsSum').innerHTML = wsSummaryHtml(id);
   const s = wsState(id), rows = wsRows(id);
   const th = (k, l, cls = '') => `<th class="sort ${cls}" data-act="ws-sort" data-id="${id}" data-k="${k}">${l}${s.sort.k === k ? `<span class="arr">${s.sort.dir > 0 ? '↑' : '↓'}</span>` : ''}</th>`;
-  box.innerHTML = (DB.readOnly ? `<div class="note warn" style="margin-bottom:12px">${ic('lock', 16)} You have view-only access. Ask the owner to invite you as an Editor to make changes.</div>` : '') + (rows.length ? `<div class="table-scroll"><table class="sheet"><thead><tr>
+  const MAXR = 300, shown = rows.slice(0, MAXR);
+  box.innerHTML = (DB.isCapped(id) ? `<div class="note warn" style="margin-bottom:12px">${ic('lock', 16)} Showing the latest ${DB.MAX_ROWS} rows. Pick a month to see the rest.</div>` : '') + (DB.readOnly && DB.role !== 'freelancer' ? `<div class="note warn" style="margin-bottom:12px">${ic('lock', 16)} You have view-only access. Ask the owner to invite you as an Editor to make changes.</div>` : '') + (rows.length ? `<div class="table-scroll"><table class="sheet"><thead><tr>
       ${th('assignDate', 'Assignment date')}${th('deliveryDate', 'Delivery date')}${th('client', 'Client')}${th('type', 'Type')}${th('subject', 'Subject')}${th('status', 'Status')}${th('paymentStatus', 'Payment')}<th>Posting link</th><th>Notes</th>${th('rate', 'Amount', 'num')}<th></th>
-    </tr></thead><tbody>${rows.map(rowHtml).join('')}</tbody></table></div>`
-    : `<div class="empty"><div class="big">No deliverables ${s.q ? 'match your search' : 'in ' + periodLabel(s.ym)}</div>Use “Add Deliverable” or import a sheet.</div>`)
-    + `<div class="dt-foot"><span class="muted">${rows.length} row${rows.length === 1 ? '' : 's'} · ${periodLabel(s.ym)}</span><span class="muted">Amounts are filled from the freelancer’s rates and can be edited per row.</span></div>`;
+    </tr></thead><tbody>${shown.map(rowHtml).join('')}</tbody></table></div>${rows.length > MAXR ? `<div class="note" style="margin-top:10px">Showing the first ${MAXR} of ${rows.length} rows. Use search or the month filter to narrow down.</div>` : ''}`
+    : DB.dLoading.has(id) ? `<div class="empty"><div class="big">Loading…</div></div>` : `<div class="empty"><div class="big">No deliverables ${s.q ? 'match your search' : 'in ' + periodLabel(s.ym)}</div>${DB.role === 'freelancer' ? 'Nothing is assigned to you in this period.' : 'Use “Add Deliverable” or import a sheet.'}</div>`)
+    + `<div class="dt-foot"><span class="muted">${rows.length} row${rows.length === 1 ? '' : 's'} · ${periodLabel(s.ym)}</span><span class="muted">${DB.role === 'freelancer' ? '' : 'Amounts are filled from the freelancer’s rates and can be edited per row.'}</span></div>`;
+}
+const TYPE_TINT = { 'Short Format Reel': 0, 'Long Format Video': 1, 'Static Creative': 2, 'Carousel': 3, 'Banner': 4, 'Other': 7 };
+const tintOf = (kind, name) => !name ? -1 : kind === 't' && name in TYPE_TINT ? TYPE_TINT[name] : hashStr(kind + name) % 8;
+function roRow(d) {
+  const url = safeUrl(d.link);
+  return `<tr data-id="${d.id}"><td class="c-date">${fmtDateY(d.assignDate)}</td><td class="c-date">${fmtDateY(d.deliveryDate)}</td><td class="c-client">${d.client ? `<span class="pill tint tint-${tintOf('c', d.client)}">${esc(d.client)}</span>` : '—'}</td><td class="c-type"><span class="pill tint tint-${tintOf('t', d.type)}">${esc(d.type)}</span></td><td class="c-subject">${esc(d.subject)}</td>
+    <td><span class="pill st-${slug(d.status)}">${esc(d.status)}</span></td><td><span class="pill pay-${slug(d.paymentStatus)}">${esc(d.paymentStatus)}</span></td>
+    <td>${url ? `<a class="open-link" href="${esc(url)}" target="_blank" rel="noopener noreferrer">Open ${ic('arrow', 14)}</a>` : '—'}</td><td class="c-notes">${esc(d.notes) || '—'}</td><td class="c-rate num">${money(d.rate)}</td><td></td></tr>`;
 }
 function rowHtml(d) {
+  if (DB.role === 'freelancer') return roRow(d);
   const url = safeUrl(d.link);
   const card = DB.rateFor(d.freelancerId, d.type);
   return `<tr data-id="${d.id}">
     <td class="c-date"><input type="date" class="cell-in" data-f="assignDate" value="${d.assignDate}" aria-label="Assignment date"></td>
     <td class="c-date"><input type="date" class="cell-in" data-f="deliveryDate" value="${d.deliveryDate}" aria-label="Delivery date"></td>
-    <td class="c-client"><select class="cell-in" data-f="client" aria-label="Client">${clientOptions(d.client)}</select></td>
-    <td class="c-type"><select class="cell-in" data-f="type" aria-label="Type">${typeOptions(d.type)}</select></td>
+    <td class="c-client"><select class="cell-in tint tint-${tintOf('c', d.client)}" data-f="client" aria-label="Client">${clientOptions(d.client)}</select></td>
+    <td class="c-type"><select class="cell-in tint tint-${tintOf('t', d.type)}" data-f="type" aria-label="Type">${typeOptions(d.type)}</select></td>
     <td class="c-subject"><input class="cell-in" data-f="subject" value="${esc(d.subject)}" placeholder="Add subject…" aria-label="Subject"></td>
     <td><select class="cell-in pill st-${slug(d.status)}" data-f="status" aria-label="Status">${STATUSES.map(t => opt(t, t, d.status)).join('')}</select></td>
     <td><select class="cell-in pill pay-${slug(d.paymentStatus)}" data-f="paymentStatus" aria-label="Payment status">${PAY_STATUSES.map(t => opt(t, t, d.paymentStatus)).join('')}</select></td>
@@ -255,10 +327,10 @@ function rowHtml(d) {
   </tr>`;
 }
 function rateCardHtml(f) {
-  return `<section class="card"><div class="card-head"><div><h3>Rates</h3><p>The amount for each new deliverable is filled in from these rates. Changing a rate doesn’t alter deliverables already recorded — edit their amount in the table if needed.</p></div></div>
-    <div class="rate-grid" id="rateGrid">${DB.types().map((t, i) => `<label class="rate-item tone-${TONES[i % TONES.length]}"><span>${ic(typeIcon(t), 16)} ${esc(t)}</span><div class="money-in"><i>${esc(DB.S.currency)}</i><input type="number" min="0" step="1" data-type="${esc(t)}" value="${DB.rateFor(f.id, t)}" aria-label="${esc(t)} rate"></div></label>`).join('')}</div>
+  return `<section class="card"><div class="card-head"><div><h3>Rates</h3><p>Every freelancer has their own prices. The amount for each new deliverable is filled in from these rates; leave a type blank if you’ll enter the amount yourself. Changing a rate doesn’t alter deliverables already recorded — edit their amount in the table if needed.</p></div></div>
+    <div class="rate-grid" id="rateGrid">${DB.types().map((t, i) => `<label class="rate-item tone-${TONES[i % TONES.length]}"><span>${ic(typeIcon(t), 16)} ${esc(t)}</span><div class="money-in"><i>${esc(DB.S.currency)}</i><input type="number" min="0" step="1" data-type="${esc(t)}" value="${DB.hasRate(f.id, t) ? DB.rateFor(f.id, t) : ''}" placeholder="Not set" ${DB.role === 'freelancer' ? 'disabled' : ''} aria-label="${esc(t)} rate"></div></label>`).join('')}</div>
     <p class="hint" style="margin-top:12px">Need another type? Pick “＋ Add type…” in any Type dropdown, or manage types in Settings.</p>
-    <div class="btn-row" style="justify-content:flex-end;margin-top:16px"><button class="btn dark" data-act="rates-save" data-id="${f.id}">Save rates</button></div></section>`;
+    ${DB.role === 'freelancer' ? '' : `<div class="btn-row" style="justify-content:flex-end;margin-top:16px"><button class="btn dark" data-act="rates-save" data-id="${f.id}">Save rates</button></div>`}</section>`;
 }
 
 /* ---------- add / edit deliverable ---------- */
@@ -284,7 +356,7 @@ function openDeliverableModal(fid, id) {
     </form></div>
     <div class="m-foot">${!d ? '<button class="btn" id="dMore">Save & add another</button>' : ''}<button class="btn dark" id="dSave">${d ? 'Save changes' : 'Add deliverable'}</button></div>`);
   const form = $('#dform', m), el = n => form.elements[n];
-  const hint = () => { $('#rateHint', m).innerHTML = `Rate for ${esc(el('type').value)}: <b>${money(DB.rateFor(fid, el('type').value))}</b>`; };
+  const hint = () => { $('#rateHint', m).innerHTML = `Rate for ${esc(el('type').value)}: <b>${DB.hasRate(fid, el('type').value) ? money(DB.rateFor(fid, el('type').value)) : 'not set, enter the amount'}</b>`; };
   el('rate').addEventListener('input', () => { el('rate').dataset.touched = '1'; });
   el('type').addEventListener('change', () => { if (el('type').value === ADD) return; if (el('rate').dataset.touched !== '1') el('rate').value = DB.rateFor(fid, el('type').value); hint(); });
   wireInlineAdd(m, () => { if (el('rate').dataset.touched !== '1') el('rate').value = DB.rateFor(fid, el('type').value); hint(); });
@@ -351,9 +423,10 @@ function openDownload(fid) {
       <button class="share-opt" data-fmt="xlsx"><span class="li-icon">${ic('sheet')}</span><span><b>Excel (.xlsx)</b><span>Opens in Excel; upload to Google Drive to open in Google Sheets.</span></span></button>
       <button class="share-opt" data-fmt="csv"><span class="li-icon">${ic('file')}</span><span><b>CSV (.csv)</b><span>Google Sheets: File → Import.</span></span></button>
     </div></div>`, { size: 'sm' });
-  $$('[data-fmt]', m).forEach(b => b.onclick = () => {
+  $$('[data-fmt]', m).forEach(b => b.onclick = async () => {
     const g = k => $(`[data-dl][data-k="${k}"]`, m).value;
-    exportFreelancer(fid, periodFrom(g('y'), g('m')), b.dataset.fmt);
+    const per = periodFrom(g('y'), g('m')); toast('Preparing file…'); try { await DB.loadPeriod(fid, per); } catch (e) { /* export what is loaded */ }
+    exportFreelancer(fid, per, b.dataset.fmt);
     closeModal();
   });
 }
@@ -388,6 +461,16 @@ function listEditor(kind, list) {
   return `<div class="list-edit">${list.map(x => `<div class="le-row"><input class="inp" data-on="rename-${kind}" data-old="${esc(x)}" value="${esc(x)}" aria-label="${kind} name"><span class="muted le-n" title="Deliverables using it">${DB.usage(kind, x) || ''}</span><button class="icon-btn xs danger" data-act="rm-${kind}" data-name="${esc(x)}" title="Remove">${ic('trash', 15)}</button></div>`).join('') || `<p class="muted" style="font-size:12.5px;margin:4px 0">No ${kind}s yet.</p>`}</div>
     <div class="le-add"><input class="inp" id="new-${kind}" placeholder="New ${kind} name" aria-label="New ${kind} name"><button class="btn sm dark" data-act="add-${kind}">${ic('plus', 14)} Add ${kind}</button></div>`;
 }
+async function refreshAdmins(force) {
+  if (!$('#adminBox')) return;
+  const draw = () => {
+    const b = $('#adminBox'); if (!b || !DB.admins) return; const me = (DB.user?.email || '').toLowerCase();
+    b.innerHTML = `<div class="list-edit">${DB.admins.map(e => `<div class="le-row"><span style="flex:1;word-break:break-all">${esc(e)}${e.toLowerCase() === me ? ' <span class="muted">(you)</span>' : ''}</span>${e.toLowerCase() === me ? '' : `<button class="icon-btn xs danger" data-act="admin-rm" data-email="${esc(e)}" title="Remove admin">${ic('trash', 15)}</button>`}</div>`).join('')}</div>
+      <div class="le-add"><input class="inp" id="new-admin" type="email" placeholder="New admin’s email" aria-label="New admin email"><button class="btn sm dark" data-act="add-admin">${ic('plus', 14)} Add admin</button></div>`;
+  };
+  if (DB.admins) draw();
+  if (force || !DB.admins || Date.now() - DB._adminsAt > 10000) { try { await DB.loadAdmins(); draw(); } catch (e) { const b = $('#adminBox'); if (b) b.innerHTML = '<p class="muted">Couldn’t load the admin list.</p>'; } }
+}
 function viewSettings() {
   const S = DB.S;
   return `<header class="topbar"><div><h1>Settings</h1><p class="sub">Shared by everyone using this CRM</p></div></header>
@@ -395,12 +478,11 @@ function viewSettings() {
     <section class="card"><div class="card-head"><div><h3>Clients</h3><p>The options in every Client dropdown. Renaming a client updates its deliverables too. The number shows how many deliverables use it.</p></div></div>${listEditor('client', DB.clients())}</section>
     <section class="card"><div class="card-head"><div><h3>Deliverable types</h3><p>The options in every Type dropdown. Renaming a type updates its deliverables and rates.</p></div></div>${listEditor('type', DB.types())}</section>
   </div><div style="display:grid;gap:16px;align-content:start">
+    <section class="card"><div class="card-head"><div><h3>Admins</h3><p>Admins see everything, including every freelancer’s rates and payments. Each admin creates an account on the site with their own email.</p></div></div><div id="adminBox"><p class="muted">Loading…</p></div></section>
     <section class="card"><div class="card-head"><div><h3>General</h3></div></div>
       <div class="set-row"><div class="lbl"><b>Currency symbol</b><span>Shown on amounts and downloads</span></div><input class="inp" style="width:90px;text-align:center" data-on="set-currency" value="${esc(S.currency)}" maxlength="4" aria-label="Currency symbol"></div>
       <div class="set-row"><div class="lbl"><b>Monthly total includes</b><span>Which deliverables count toward a freelancer’s total</span></div>
         <select class="fsel" data-on="set-rule" aria-label="Monthly total rule">${opt('approved', 'Approved only', S.totalRule)}${opt('all', 'All except rejected', S.totalRule)}</select></div></section>
-    <section class="card"><div class="card-head"><div><h3>Default rates</h3><p>Used for new freelancers, and for any type a freelancer has no rate for yet.</p></div></div>
-      <div class="tbl-wrap"><table class="plain"><tbody>${DB.types().map(t => `<tr><td>${esc(t)}</td><td class="num"><input type="number" min="0" class="inp" style="height:36px;width:120px;text-align:right" data-on="set-rate" data-type="${esc(t)}" value="${+(S.defaultRates?.[t] ?? 0)}" aria-label="${esc(t)} default rate"></td></tr>`).join('')}</tbody></table></div></section>
     <section class="card"><div class="card-head"><div><h3>Backup</h3><p>Everything is saved online automatically. Download a copy of all records if you want your own backup.</p></div></div>
       <button class="btn" data-act="backup">${ic('download', 16)} Download backup (.json)</button></section>
   </div></div>`;
@@ -412,6 +494,15 @@ const ACT = {
   'fl-add': () => openFreelancerModal(),
   'fl-edit': t => openFreelancerModal(t.dataset.id),
   'fl-del': t => deleteFreelancer(t.dataset.id),
+  'auth-in': async () => { const m = $('#authMsg'); m.textContent = ''; m.className = 'auth-msg'; try { await DB.signIn($('#authEmail').value, $('#authPw').value); } catch (e) { m.textContent = e.message; } },
+  'auth-up': async () => { const m = $('#authMsg'); m.className = 'auth-msg'; try { const r = await DB.signUp($('#authEmail').value, $('#authPw').value); if (r === 'confirm') { m.className = 'auth-msg ok'; m.textContent = 'Account created. Open the confirmation email, click the link, then sign in here.'; } } catch (e) { m.textContent = e.message; } },
+  'auth-reset': async () => { const m = $('#authMsg'); m.className = 'auth-msg'; try { await DB.resetPassword($('#authEmail').value); m.className = 'auth-msg ok'; m.textContent = 'Password reset email sent. Check your inbox.'; } catch (e) { m.textContent = e.message; } },
+  'auth-newpw': async () => { const m = $('#authMsg'); try { await DB.setPassword($('#authPw').value); } catch (e) { m.textContent = e.message; } },
+  'sign-out': async () => { await DB.signOut(); },
+  'add-admin': async () => { const i = $('#new-admin'); try { await DB.addAdmin(i.value); toast('Admin added. They create an account with that email.'); refreshAdmins(true); } catch (e) { toast(e.message, 'error'); } },
+  'admin-rm': async t => { const em = t.dataset.email; if (!await confirmDialog({ title: `Remove ${em} as admin?`, body: 'They will no longer see rates, payments or settings.', confirmText: 'Remove', danger: true })) return; try { await DB.removeAdmin(em); toast('Admin removed'); refreshAdmins(true); } catch (e) { toast(e.message, 'error'); } },
+  'fl-view': t => { ui.flView = t.dataset.v; rerender(); },
+  'team-open': t => { location.hash = '#/team/' + t.dataset.id; },
   'fl-open': t => { location.hash = '#/freelancers/' + t.dataset.id; },
   'ws-tab': t => { wsState(t.dataset.id).tab = t.dataset.tab; rerender(); },
   'ws-sort': t => { const s = wsState(t.dataset.id); s.sort = { k: t.dataset.k, dir: s.sort.k === t.dataset.k ? -s.sort.dir : 1 }; wsRefresh(t.dataset.id); },
@@ -425,11 +516,11 @@ const ACT = {
   'rates-save': t => { const rates = {}; $$('#rateGrid input').forEach(i => rates[i.dataset.type] = i.value); const n = DB.setRates(t.dataset.id, rates); toast(n ? 'Rates saved — they apply to new deliverables' : 'No changes'); },
   'import-open': t => Importer.open(t.dataset.id),
   'download-open': t => openDownload(t.dataset.id),
-  'backup': () => saveFile(`gfc-crm-backup-${todayISO()}.json`, JSON.stringify(DB.d, null, 1)),
+  'backup': async () => { toast('Preparing backup…'); try { saveFile(`gfc-crm-backup-${todayISO()}.json`, JSON.stringify(await DB.exportAll(), null, 1)); } catch (e) { toast('Backup failed. Check your connection and try again.', 'error'); } },
   'add-client': () => { try { const n = DB.addClient($('#new-client').value); toast(`Client “${n}” added`); rerender(); setTimeout(() => $('#new-client')?.focus(), 20); } catch (e) { toast(e.message, 'error'); } },
   'add-type': () => { try { const n = DB.addType($('#new-type').value); toast(`Type “${n}” added`); rerender(); setTimeout(() => $('#new-type')?.focus(), 20); } catch (e) { toast(e.message, 'error'); } },
-  'rm-client': async t => { const n = t.dataset.name; try { if (DB.usage('client', n)) return DB.removeClient(n); if (!await confirmDialog({ title: `Remove “${n}”?`, body: 'It will no longer appear in the Client dropdown.', confirmText: 'Remove', danger: true })) return; DB.removeClient(n); toast('Client removed'); rerender(); } catch (e) { toast(e.message, 'error'); } },
-  'rm-type': async t => { const n = t.dataset.name; try { if (DB.usage('type', n)) return DB.removeType(n); if (!await confirmDialog({ title: `Remove “${n}”?`, body: 'It will no longer appear in the Type dropdown. Rates set for it are kept in case you add it back.', confirmText: 'Remove', danger: true })) return; DB.removeType(n); toast('Type removed'); rerender(); } catch (e) { toast(e.message, 'error'); } },
+  'rm-client': async t => { const n = t.dataset.name; try { await DB.assertUnused('client', n); if (!await confirmDialog({ title: `Remove “${n}”?`, body: 'It will no longer appear in the Client dropdown.', confirmText: 'Remove', danger: true })) return; DB.removeClient(n); toast('Client removed'); rerender(); } catch (e) { toast(e.message, 'error'); } },
+  'rm-type': async t => { const n = t.dataset.name; try { await DB.assertUnused('type', n); if (!await confirmDialog({ title: `Remove “${n}”?`, body: 'It will no longer appear in the Type dropdown. Rates set for it are kept in case you add it back.', confirmText: 'Remove', danger: true })) return; DB.removeType(n); toast('Type removed'); rerender(); } catch (e) { toast(e.message, 'error'); } },
 };
 
 document.addEventListener('click', e => {
@@ -441,13 +532,14 @@ document.addEventListener('click', e => {
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && $('.modal-bg')) { closeModal(); return; }
   if (e.key === 'Enter' && e.target.matches('[data-act="fl-open"]')) e.target.click();
-  if (e.key === 'Enter' && (e.target.id === 'new-client' || e.target.id === 'new-type')) ACT[e.target.id.replace('new-', 'add-')]();
+  if (e.key === 'Enter' && (e.target.id === 'new-client' || e.target.id === 'new-type' || e.target.id === 'new-admin')) ACT[e.target.id.replace('new-', 'add-')]();
   if (e.key === 'Enter' && e.target.matches('.cell-in:not(select)')) e.target.blur();
 });
 let qTimer;
 document.addEventListener('input', e => {
   const t = e.target, on = t.dataset.on;
   if (on === 'fl-q') { ui.flQ = t.value; $('#flGrid').innerHTML = flGrid(); }
+  if (on === 'team-q') { ui.teamQ = t.value; $('#teamGrid').innerHTML = teamGrid(); }
   if (on === 'ws-q') { clearTimeout(qTimer); qTimer = setTimeout(() => { wsState(t.dataset.id).q = t.value; wsRefresh(t.dataset.id); }, 160); }
 });
 document.addEventListener('change', async e => {
@@ -482,11 +574,13 @@ document.addEventListener('change', async e => {
   if (on === 'set-rule') { DB.S.totalRule = t.value; DB.saveSettings(); toast('Saved'); }
   if (on === 'set-rate') { DB.S.defaultRates = { ...DB.S.defaultRates, [t.dataset.type]: Math.max(0, +t.value || 0) }; DB.saveSettings(); toast('Default rate saved'); }
   if (on === 'rename-client' || on === 'rename-type') {
-    try { on === 'rename-client' ? DB.renameClient(t.dataset.old, t.value) : DB.renameType(t.dataset.old, t.value); toast('Renamed'); rerender(); }
+    try { await (on === 'rename-client' ? DB.renameClient(t.dataset.old, t.value) : DB.renameType(t.dataset.old, t.value)); toast('Renamed'); rerender(); }
     catch (err) { toast(err.message, 'error'); t.value = t.dataset.old; }
   }
 });
 window.addEventListener('hashchange', () => { closeModal(); route(); });
+document.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.closest?.('.login')) { e.preventDefault(); ACT[DB.state === 'recovery' ? 'auth-newpw' : 'auth-in'](); } });
+document.addEventListener('click', e => { if (!e.target.closest('[data-act="copy-id"]')) return; const done = () => toast('ID copied'); (navigator.clipboard?.writeText(DB.myId) || Promise.reject()).then(done, () => { const c = $('.idbox code'); if (c) { const r = document.createRange(); r.selectNodeContents(c); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); } toast('Press Ctrl+C to copy the selected ID'); }); });
 
 /* Live updates from other people redraw the page, but never under someone who is typing or has a dialog open. */
 const isEditing = () => !!$('.modal-bg') || !!document.activeElement?.matches?.('#main input, #main select, #main textarea');
