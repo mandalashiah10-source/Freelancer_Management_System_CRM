@@ -1,17 +1,17 @@
 'use strict';
-/* ===== Data layer: shared online store (the artifact's `db` capability) =====
-   Collections: freelancers/{id}, deliverables/{id}; settings live in settings/app
-   (currency, total rule, default rates, the editable Types and Clients lists).
-   The UI reads a synchronous in-memory cache; every change updates the cache at
-   once and is written to the store in the background (max 4 writes in flight,
-   latest version per document wins). Live snapshots from other people refresh
-   the cache; documents with unsaved local edits keep the local copy. */
+/* ===== Data layer: Supabase (real database + email/password login) =====
+   Who can see what is enforced by the database itself (row level security, see schema.sql):
+   - owner (listed in the `admins` table): everything
+   - a freelancer: the team's work (client, type, subject, status, dates, link) PLUS their OWN rates,
+     amounts, payment status and notes. Other people's money is never sent to their browser.
+   The UI reads a synchronous in-memory cache; changes update the cache at once and are saved in
+   the background in batches. Only one freelancer + one period (max 1000 rows) is loaded at a time. */
 
 const DEFAULT_TYPES = ['Short Format Reel', 'Long Format Video', 'Static Creative', 'Carousel', 'Banner', 'Other'];
 const STATUSES = ['Allotted', 'In Review', 'In Changes', 'Approved', 'Rejected'];
 const PAY_STATUSES = ['Unpaid', 'Paid'];
 
-const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+const uid = () => (crypto.randomUUID ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 3 | 8)).toString(16); }));
 const pad = n => String(n).padStart(2, '0');
 const isoOf = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const todayISO = () => isoOf(new Date());
@@ -22,103 +22,190 @@ const monthLabel = ym => { if (!ym) return 'All months'; const [y, m] = ym.split
 const sumRate = arr => arr.reduce((s, d) => s + (+d.rate || 0), 0);
 const clone = o => JSON.parse(JSON.stringify(o));
 const stable = o => JSON.stringify(o, (k, v) => v && typeof v === 'object' && !Array.isArray(v) ? Object.keys(v).sort().reduce((a, x) => (a[x] = v[x], a), {}) : v);
+const chunks = (arr, n) => { const o = []; for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n)); return o; };
+const one = x => (Array.isArray(x) ? x[0] : x) || null;
+const isoTs = n => new Date(n || Date.now()).toISOString();
+const okEmail = s => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
 
 function defaultSettings() {
-  return {
-    currency: '₹', totalRule: 'approved', types: [...DEFAULT_TYPES], clients: [],
-    defaultRates: { 'Short Format Reel': 300, 'Long Format Video': 800, 'Static Creative': 150, 'Carousel': 250, 'Banner': 150, 'Other': 100 },
-  };
+  return { currency: '₹', totalRule: 'approved', types: [...DEFAULT_TYPES], clients: [], defaultRates: {} };
 }
 
 const DB = {
-  d: { settings: defaultSettings(), freelancers: [], deliverables: [] },
-  store: null, state: 'loading', loaded: false, readOnly: false,
+  d: { settings: defaultSettings(), freelancers: [], deliverables: [], team: [], work: [] },
+  sb: null, user: null, state: 'loading', loaded: false, readOnly: false, role: null, myId: null,
+  MAX_ROWS: 1000, dLoading: new Set(), capped: new Set(), workLoading: false,
   onChange: () => {}, onStatus: () => {},
-  _ready: { freelancers: false, deliverables: false, settings: false },
-  _server: { freelancers: new Map(), deliverables: new Map(), settings: null },
-  _pending: new Map(), _inflight: new Set(), _active: 0,
+  _dirtyD: new Map(), _dirtyF: new Map(), _delD: new Set(), _delF: new Set(), _flightD: new Set(), _setDirty: false,
+  _flushing: false, _again: false, _t: null, _subKey: null, _wk: null, _lastLoad: 0, _booting: false,
 
   get S() { return this.d.settings; },
   types() { return this.S.types?.length ? this.S.types : DEFAULT_TYPES; },
   clients() { return [...(this.S.clients || [])].sort((a, b) => a.localeCompare(b)); },
 
-  /* ---------- connection ---------- */
+  /* ---------- login ---------- */
   async connect() {
-    const db = window.claude?.use ? await window.claude.use('db') : null;
-    if (!db) { this.state = 'offline'; this.onStatus(); return; }
-    this.store = db;
-    try { const user = await window.claude.use('user'); const w = user ? await user.can('data.write') : null; this.readOnly = w === false; } catch (e) { /* unknown: let writes decide */ }
-    const timer = setTimeout(() => { if (!this.loaded) { this.state = 'slow'; this.onStatus(); } }, 10000);
-    const done = () => { if (!this.loaded && this._ready.freelancers && this._ready.deliverables && this._ready.settings) { this.loaded = true; this.state = 'ok'; clearTimeout(timer); this.onStatus(); this.onChange(true); } };
-    const fail = e => { clearTimeout(timer); this.state = e?.code === 'revoked' ? 'offline' : 'error'; this.onStatus(); };
-    for (const col of ['freelancers', 'deliverables']) {
-      db.collection(col).onSnapshot(snap => {
-        const server = new Map(snap.docs.map(x => [x.id, { ...clone(x.data()), id: x.id }]));
-        this._server[col] = server;
-        const local = new Map(this.d[col].map(x => [x.id, x]));
-        const next = [];
-        for (const [id, doc] of server) { const k = col + '/' + id; if (this._dirty(k)) { if (local.has(id)) next.push(local.get(id)); } else next.push(doc); }
-        for (const [id, doc] of local) if (!server.has(id) && this._dirty(col + '/' + id) && this._pending.get(col + '/' + id) !== null) next.push(doc);
-        const changed = next.length !== this.d[col].length || next.some(x => { const o = local.get(x.id); return !o || stable(o) !== stable(x); });
-        if (changed) { this.d[col] = next; this.onChange(); }
-        if (!snap.metadata.fromCache) { this._ready[col] = true; done(); }
-      }, fail);
+    const cfg = window.GFC_CONFIG || {};
+    if (!cfg.url || !cfg.anonKey || /YOUR[-_]/i.test(cfg.url + cfg.anonKey) || !window.supabase) { this.state = 'setup'; this.onStatus(); return; }
+    this.sb = window.supabase.createClient(cfg.url, cfg.anonKey, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } });
+    this.sb.auth.onAuthStateChange((ev, session) => {
+      setTimeout(() => {
+        if (ev === 'PASSWORD_RECOVERY') { this.state = 'recovery'; this.onStatus(); return; }
+        if (!session) { this._reset(); this.state = 'login'; this.onStatus(); return; }
+        if (this.state === 'recovery') return;
+        if (!this.user || this.user.id !== session.user.id) { this.user = session.user; this._boot(); }
+      }, 0);
+    });
+    window.addEventListener('focus', () => this.refresh());
+  },
+  _reset() { this.user = null; this.role = null; this.myId = null; this.loaded = false; this.readOnly = false; this._subKey = null; this._wk = null; this.d = { settings: defaultSettings(), freelancers: [], deliverables: [], team: [], work: [] }; },
+  async signIn(email, password) { const { error } = await this.sb.auth.signInWithPassword({ email: email.trim(), password }); if (error) throw new Error(/confirm/i.test(error.message) ? 'Please confirm your email first. Check your inbox for the link.' : 'Wrong email or password.'); },
+  async signUp(email, password) {
+    if (!okEmail(email.trim())) throw new Error('Enter a valid email.');
+    if ((password || '').length < 8) throw new Error('Use a password of at least 8 characters.');
+    const { data, error } = await this.sb.auth.signUp({ email: email.trim(), password, options: { emailRedirectTo: location.origin + location.pathname } });
+    if (error) throw new Error(error.message);
+    return data.session ? 'in' : 'confirm';
+  },
+  async resetPassword(email) { if (!okEmail(email.trim())) throw new Error('Type your email above first.'); const { error } = await this.sb.auth.resetPasswordForEmail(email.trim(), { redirectTo: location.origin + location.pathname }); if (error) throw new Error(error.message); },
+  async setPassword(pw) {
+    if ((pw || '').length < 8) throw new Error('Use a password of at least 8 characters.');
+    const { error } = await this.sb.auth.updateUser({ password: pw }); if (error) throw new Error(error.message);
+    this.state = 'loading'; this.user = null; this.onStatus();
+    const { data } = await this.sb.auth.getSession();
+    if (data.session) { this.user = data.session.user; this._boot(); } else { this.state = 'login'; this.onStatus(); }
+  },
+  async signOut() { await this.idle(); await this.sb.auth.signOut(); },
+
+  /* ---------- loading ---------- */
+  _fRow(r) { const p = one(r.freelancer_private); return { id: r.id, name: r.name, description: r.description || '', avatar: r.avatar || '', userId: r.user_id, linked: !!r.user_id, email: p?.email || '', rates: p?.rates || {}, createdAt: Date.parse(r.created_at) || 0 }; },
+  _dRow(r) { const m = one(r.deliverable_money); return { id: r.id, freelancerId: r.freelancer_id, assignDate: r.assign_date, deliveryDate: r.delivery_date || '', client: r.client || '', type: r.type || '', subject: r.subject || '', status: r.status, link: r.link || '', importBatch: r.import_batch || null, createdAt: Date.parse(r.created_at) || 0, updatedAt: Date.parse(r.updated_at) || 0, paymentStatus: m?.payment_status || 'Unpaid', notes: m?.notes || '', rate: +(m?.rate ?? 0), rateSource: m?.rate_source || 'card' }; },
+  async _boot(quiet) {
+    if (this._booting) return; this._booting = true;
+    if (!quiet) { this.state = 'loading'; this.loaded = false; this.onStatus(); }
+    try {
+      await this.sb.rpc('claim_profile');
+      const adm = await this.sb.from('admins').select('email').limit(1); if (adm.error) throw adm.error;
+      this.role = adm.data.length ? 'owner' : 'freelancer';
+      const [st, fl] = await Promise.all([
+        this.sb.from('settings').select('data').eq('id', 1).maybeSingle(),
+        this.sb.from('freelancers').select('id,name,description,avatar,user_id,created_at,freelancer_private(email,rates)').order('name'),
+      ]);
+      if (st.error) throw st.error; if (fl.error) throw fl.error;
+      if (!this._setDirty) this.d.settings = { ...defaultSettings(), ...(st.data?.data || {}) };
+      const all = fl.data.map(r => this._fRow(r));
+      if (this.role === 'owner') { this.readOnly = false; this.d.freelancers = all; this.d.team = []; }
+      else {
+        this.readOnly = true; const me = all.find(f => f.userId === this.user.id); this.myId = me?.id || null;
+        this.d.freelancers = me ? [me] : []; this.d.team = all.map(f => ({ id: f.id, name: f.name, description: f.description, avatar: f.avatar }));
+      }
+      this._lastLoad = Date.now(); this._subKey = null; this._wk = null;
+      const first = !this.loaded; this.loaded = true; this.state = 'ok'; this.onStatus(); this.onChange(first);
+    } catch (e) {
+      if (!quiet) { this.state = 'error'; this.onStatus(); } else (window.toast || console.error)('Couldn’t refresh. Check your connection.', 'error');
+    } finally { this._booting = false; }
+  },
+  async refresh() { if (!this.loaded || this.saving() || Date.now() - this._lastLoad < 20000) return; await this._boot(true); },
+
+  _range(ym) {
+    if (!ym) return null;
+    if (ym.length === 4) return [ym + '-01-01', ym + '-12-31'];
+    const [y, m] = ym.split('-'); return [`${ym}-01`, `${ym}-${pad(new Date(+y, +m, 0).getDate())}`];
+  },
+  async _fetchD(fid, ym, from, to, money) {
+    let q = this.sb.from('deliverables').select(money ? '*, deliverable_money(rate,rate_source,payment_status,notes)' : '*').eq('freelancer_id', fid);
+    const r = this._range(ym); if (r) q = q.gte('assign_date', r[0]).lte('assign_date', r[1]);
+    const { data, error } = await q.order('assign_date', { ascending: false }).order('created_at', { ascending: false }).range(from, to);
+    if (error) throw error; return data.map(x => this._dRow(x));
+  },
+  isCapped(fid) { return this.capped.has(fid); },
+  _isDirtyD(id) { return this._dirtyD.has(id) || this._flightD.has(id); },
+  /** Keep ONE freelancer's deliverables for ONE period (max 1000 rows) in memory. */
+  async watch(fid, ym) {
+    if (!this.sb || !fid) return;
+    const key = fid + '|' + (ym || ''); if (this._subKey === key) return; this._subKey = key;
+    this.dLoading.add(fid); this.capped.delete(fid);
+    this.d.deliverables = this.d.deliverables.filter(d => d.freelancerId === fid || this._isDirtyD(d.id));
+    try {
+      const own = this.role === 'owner' || fid === this.myId;
+      const rows = await this._fetchD(fid, ym, 0, this.MAX_ROWS - 1, own);
+      if (this._subKey !== key) return;
+      const keep = this.d.deliverables.filter(d => d.freelancerId !== fid || this._isDirtyD(d.id)), have = new Set(keep.map(d => d.id));
+      this.d.deliverables = [...keep, ...rows.filter(r => !have.has(r.id))];
+      if (rows.length >= this.MAX_ROWS) this.capped.add(fid);
+    } catch (e) { this._subKey = null; (window.toast || console.error)('Couldn’t load deliverables. Check your connection.', 'error'); }
+    this.dLoading.delete(fid); this.onChange();
+  },
+  /** Another freelancer's work (no money) for the Team view. */
+  async watchWork(fid, ym) {
+    if (!this.sb || !fid) return;
+    const key = fid + '|' + (ym || ''); if (this._wk === key) return; this._wk = key;
+    this.workLoading = true; this.d.work = [];
+    try { const rows = await this._fetchD(fid, ym, 0, this.MAX_ROWS - 1, false); if (this._wk !== key) return; this.d.work = rows; }
+    catch (e) { this._wk = null; (window.toast || console.error)('Couldn’t load the team’s work. Check your connection.', 'error'); }
+    this.workLoading = false; this.onChange();
+  },
+  /** One-off read of a whole period (used by downloads), any number of rows. */
+  async loadPeriod(fid, ym) {
+    if (!this.sb) return;
+    const have = new Set(this.d.deliverables.map(d => d.id)), own = this.role === 'owner' || fid === this.myId;
+    for (let from = 0; ; from += 1000) {
+      const rows = await this._fetchD(fid, ym, from, from + 999, own);
+      rows.forEach(r => { if (!have.has(r.id)) { have.add(r.id); this.d.deliverables.push(r); } });
+      if (rows.length < 1000) break;
     }
-    db.doc('settings/app').onSnapshot(snap => {
-      const s = snap.exists ? { ...defaultSettings(), ...clone(snap.data()) } : defaultSettings();
-      this._server.settings = s;
-      if (!this._dirty('settings/app') && stable(s) !== stable(this.d.settings)) { this.d.settings = s; this.onChange(); }
-      if (!snap.metadata.fromCache) { this._ready.settings = true; done(); }
-    }, fail);
   },
 
-  /* ---------- background writes ---------- */
-  _dirty(k) { return this._pending.has(k) || this._inflight.has(k); },
-  saving() { return this._pending.size + this._inflight.size; },
-  persist(key, body) { // body === null deletes
-    if (!this.store) { this.onStatus(); return; }
-    this._pending.delete(key); this._pending.set(key, body === null ? null : clone(body));
-    this._pump(); this.onStatus();
+  /* ---------- background saving (batched) ---------- */
+  saving() { return this._dirtyD.size + this._dirtyF.size + this._delD.size + this._delF.size + (this._setDirty ? 1 : 0) + (this._flushing ? 1 : 0); },
+  idle() { return new Promise(res => { const t = () => (this.saving() ? setTimeout(t, 80) : res()); t(); }); },
+  _schedule() { clearTimeout(this._t); this._t = setTimeout(() => this._flush(), 80); this.onStatus(); },
+  async _flush() {
+    if (this._flushing) { this._again = true; return; }
+    this._flushing = true;
+    try {
+      do {
+        this._again = false;
+        const F = [...this._dirtyF.values()]; this._dirtyF.clear();
+        const D = [...this._dirtyD.values()]; this._dirtyD.clear(); D.forEach(d => this._flightD.add(d.id));
+        const delD = [...this._delD]; this._delD.clear();
+        const delF = [...this._delF]; this._delF.clear();
+        const st = this._setDirty; this._setDirty = false;
+        try {
+          for (const c of chunks(F, 200)) {
+            let r = await this.sb.from('freelancers').upsert(c.map(f => ({ id: f.id, name: f.name, description: f.description || '', avatar: f.avatar || '', created_at: isoTs(f.createdAt) }))); if (r.error) throw r.error;
+            r = await this.sb.from('freelancer_private').upsert(c.map(f => ({ freelancer_id: f.id, email: f.email ? String(f.email).trim().toLowerCase() : null, rates: f.rates || {} })), { onConflict: 'freelancer_id' }); if (r.error) throw r.error;
+          }
+          if (st) { const r = await this.sb.from('settings').upsert({ id: 1, data: this.d.settings }); if (r.error) throw r.error; }
+          for (const c of chunks(D, 200)) {
+            let r = await this.sb.from('deliverables').upsert(c.map(d => ({ id: d.id, freelancer_id: d.freelancerId, assign_date: d.assignDate, delivery_date: d.deliveryDate || null, client: d.client || '', type: d.type || '', subject: d.subject || '', status: d.status, link: d.link || '', import_batch: d.importBatch || null, created_at: isoTs(d.createdAt), updated_at: isoTs(d.updatedAt) }))); if (r.error) throw r.error;
+            r = await this.sb.from('deliverable_money').upsert(c.map(d => ({ deliverable_id: d.id, freelancer_id: d.freelancerId, rate: +d.rate || 0, rate_source: d.rateSource || 'card', payment_status: d.paymentStatus === 'Paid' ? 'Paid' : 'Unpaid', notes: d.notes || '' })), { onConflict: 'deliverable_id' }); if (r.error) throw r.error;
+          }
+          for (const c of chunks(delD, 100)) { const r = await this.sb.from('deliverables').delete().in('id', c); if (r.error) throw r.error; }
+          for (const c of chunks(delF, 100)) { const r = await this.sb.from('freelancers').delete().in('id', c); if (r.error) throw r.error; }
+        } catch (e) { this._writeFailed(e); }
+        finally { D.forEach(d => this._flightD.delete(d.id)); }
+      } while (this._again || this._dirtyD.size || this._dirtyF.size || this._delD.size || this._delF.size || this._setDirty);
+    } finally { this._flushing = false; this.onStatus(); }
   },
-  _pump() {
-    while (this._active < 4) {
-      let key = null; for (const k of this._pending.keys()) if (!this._inflight.has(k)) { key = k; break; }
-      if (key === null) return;
-      const body = this._pending.get(key); this._pending.delete(key);
-      this._active++; this._inflight.add(key);
-      const ref = this.store.doc(key);
-      const run = (retry) => (body === null ? ref.delete() : ref.set(body)).catch(e => {
-        if (e?.code === 'unavailable' && retry) return new Promise(r => setTimeout(r, 600 + Math.random() * 900)).then(() => run(false));
-        throw e;
-      });
-      run(true).catch(e => this._writeFailed(key, e)).finally(() => { this._active--; this._inflight.delete(key); this.onStatus(); this._pump(); });
-    }
-  },
-  _writeFailed(key, e) {
-    const msg = e?.code === 'invalid_argument' ? 'You have view-only access, so changes aren’t saved. Ask the owner to invite you as an Editor.'
-      : e?.code === 'quota_exceeded' ? 'The database is full. Delete old deliverables to make room.'
+  _writeFailed(e) {
+    const code = e?.code || '', msg = /row-level security|permission denied/i.test(e?.message || '') || code === '42501' ? 'You don’t have permission to change this.'
+      : code === '23505' ? 'That email is already used by another freelancer.'
       : 'A change couldn’t be saved. Check your connection and try again.';
-    if (e?.code === 'invalid_argument') this.readOnly = true;
-    // Put the last server copy back so the screen matches what's really stored.
-    const [col, id] = key.split('/');
-    if (!this._dirty(key)) {
-      if (col === 'settings') this.d.settings = this._server.settings || defaultSettings();
-      else { const srv = this._server[col].get(id); this.d[col] = this.d[col].filter(x => x.id !== id); if (srv) this.d[col].push(srv); }
-      this.onChange();
-    }
     (window.toast || console.error)(msg, 'error');
+    this._dirtyD.clear(); this._dirtyF.clear(); this._delD.clear(); this._delF.clear(); this._setDirty = false;
+    this._boot(true);   // put the screen back to what is really stored
   },
-  saveSettings() { this.persist('settings/app', this.d.settings); },
-  _saveF(f) { this.persist('freelancers/' + f.id, f); },
-  _saveD(d) { this.persist('deliverables/' + d.id, d); },
+  saveSettings() { this._setDirty = true; this._schedule(); },
+  _saveF(f) { this._dirtyF.set(f.id, clone(f)); this._schedule(); },
+  _saveD(d) { this._dirtyD.set(d.id, clone(d)); this._delD.delete(d.id); this._schedule(); },
 
   /* ---------- lookups ---------- */
   freelancer(id) { return this.d.freelancers.find(f => f.id === id); },
   deliverable(id) { return this.d.deliverables.find(d => d.id === id); },
-  rateFor(fid, type) { const f = this.freelancer(fid); return +(f?.rates?.[type] ?? this.S.defaultRates?.[type] ?? 0) || 0; },
-  /** Whether a deliverable counts toward the monthly total (Settings → monthly total rule). */
+  rateFor(fid, type) { const f = this.freelancer(fid); return +(f?.rates?.[type] ?? 0) || 0; },
+  hasRate(fid, type) { const v = this.freelancer(fid)?.rates?.[type]; return v !== undefined && v !== null && v !== ''; },
   counts(d) { return this.S.totalRule === 'all' ? d.status !== 'Rejected' : d.status === 'Approved'; },
-  /** ym: 'YYYY-MM', 'YYYY' or '' for everything */
   inPeriod(d, ym) { return !ym || String(d.assignDate).startsWith(ym); },
   summary(fid, ym) {
     const items = this.d.deliverables.filter(d => d.freelancerId === fid && this.inPeriod(d, ym));
@@ -140,33 +227,36 @@ const DB = {
   },
   addClient(name, opts) { return this._listAdd('client', name, opts); },
   addType(name, opts) { return this._listAdd('type', name, opts); },
-  renameClient(oldName, name) {
+  async renameClient(oldName, name) {
     name = String(name || '').trim().replace(/\s+/g, ' ');
     if (!name) throw new Error('Client name can’t be empty.');
     if (name === oldName) return;
     if (this.S.clients.some(x => x !== oldName && normKey(x) === normKey(name))) throw new Error(`“${name}” already exists.`);
-    this.S.clients = this.S.clients.map(x => x === oldName ? name : x);
-    this.saveSettings();
-    this.d.deliverables.filter(d => d.client === oldName).forEach(d => { d.client = name; d.updatedAt = Date.now(); this._saveD(d); });
+    await this.idle();
+    const { error } = await this.sb.from('deliverables').update({ client: name }).eq('client', oldName); if (error) throw new Error('Couldn’t rename. Try again.');
+    this.S.clients = this.S.clients.map(x => x === oldName ? name : x); this.saveSettings();
+    this.d.deliverables.forEach(d => { if (d.client === oldName) d.client = name; });
   },
-  renameType(oldName, name) {
+  async renameType(oldName, name) {
     name = String(name || '').trim().replace(/\s+/g, ' ');
     if (!name) throw new Error('Type name can’t be empty.');
     if (name === oldName) return;
     if (this.types().some(x => x !== oldName && normKey(x) === normKey(name))) throw new Error(`“${name}” already exists.`);
-    this.S.types = this.types().map(x => x === oldName ? name : x);
-    if (this.S.defaultRates && oldName in this.S.defaultRates) { this.S.defaultRates[name] = this.S.defaultRates[oldName]; delete this.S.defaultRates[oldName]; }
-    this.saveSettings();
+    await this.idle();
+    const { error } = await this.sb.from('deliverables').update({ type: name }).eq('type', oldName); if (error) throw new Error('Couldn’t rename. Try again.');
+    this.S.types = this.types().map(x => x === oldName ? name : x); this.saveSettings();
     this.d.freelancers.forEach(f => { if (f.rates && oldName in f.rates) { f.rates[name] = f.rates[oldName]; delete f.rates[oldName]; this._saveF(f); } });
-    this.d.deliverables.filter(d => d.type === oldName).forEach(d => { d.type = name; d.updatedAt = Date.now(); this._saveD(d); });
+    this.d.deliverables.forEach(d => { if (d.type === oldName) d.type = name; });
   },
-  usage(kind, name) { return this.d.deliverables.filter(d => (kind === 'type' ? d.type : d.client) === name).length; },
-  removeClient(name) {
-    const n = this.usage('client', name); if (n) throw new Error(`“${name}” is used by ${n} deliverable${n > 1 ? 's' : ''}. Change those first, or rename the client instead.`);
-    this.S.clients = this.S.clients.filter(x => x !== name); this.saveSettings();
+  usage() { return 0; },
+  async assertUnused(kind, name) {
+    await this.idle();
+    const { count, error } = await this.sb.from('deliverables').select('id', { count: 'exact', head: true }).eq(kind === 'type' ? 'type' : 'client', name);
+    if (error) throw new Error('Couldn’t check. Try again.');
+    if (count) throw new Error(`“${name}” is used by ${count} deliverable${count > 1 ? 's' : ''}. Change those first, or rename it instead.`);
   },
+  removeClient(name) { this.S.clients = this.S.clients.filter(x => x !== name); this.saveSettings(); },
   removeType(name) {
-    const n = this.usage('type', name); if (n) throw new Error(`“${name}” is used by ${n} deliverable${n > 1 ? 's' : ''}. Change those first, or rename the type instead.`);
     if (this.types().length <= 1) throw new Error('Keep at least one type.');
     this.S.types = this.types().filter(x => x !== name); this.saveSettings();
   },
@@ -184,7 +274,6 @@ const DB = {
       link: (input.link || '').trim(), notes: (input.notes || '').trim(),
       rate: 0, rateSource: 'card', createdAt: now, updatedAt: now, importBatch: input.importBatch || null,
     };
-    // Amount is a snapshot: an explicit amount wins, otherwise copy the freelancer's current rate.
     if (input.rate !== null && input.rate !== undefined && input.rate !== '' && !isNaN(+input.rate)) { d.rate = Math.max(0, +input.rate); d.rateSource = input.rateSource || 'manual'; }
     else d.rate = this.rateFor(d.freelancerId, d.type);
     this.d.deliverables.push(d);
@@ -206,32 +295,68 @@ const DB = {
     this._saveD(d);
     return d;
   },
-  deleteDeliverable(id) { this.d.deliverables = this.d.deliverables.filter(d => d.id !== id); this.persist('deliverables/' + id, null); },
-  undoImport(batchId) {
-    const gone = this.d.deliverables.filter(d => d.importBatch === batchId);
-    gone.forEach(d => this.deleteDeliverable(d.id));
-    return gone.length;
+  deleteDeliverable(id) { this.d.deliverables = this.d.deliverables.filter(d => d.id !== id); this._dirtyD.delete(id); this._delD.add(id); this._schedule(); },
+  async undoImport(batchId, fid) {
+    await this.idle();
+    const { data, error } = await this.sb.from('deliverables').delete().eq('import_batch', batchId).eq('freelancer_id', fid).select('id');
+    if (error) throw new Error('Couldn’t undo. Try again.');
+    const ids = new Set((data || []).map(x => x.id)); this.d.deliverables = this.d.deliverables.filter(d => !ids.has(d.id) && d.importBatch !== batchId);
+    return ids.size;
+  },
+
+  /** Everything the owner can see, all freelancers and all months (for backups). */
+  async exportAll() {
+    await this.idle();
+    const out = { exportedAt: new Date().toISOString(), settings: this.S, freelancers: this.d.freelancers.map(f => ({ ...f, avatar: undefined })), deliverables: [] };
+    for (const f of this.d.freelancers) for (let from = 0; ; from += 1000) { const rows = await this._fetchD(f.id, '', from, from + 999, true); out.deliverables.push(...rows); if (rows.length < 1000) break; }
+    return out;
+  },
+
+  /* ---------- admins ---------- */
+  admins: null, _adminsAt: 0,
+  async loadAdmins() { const { data, error } = await this.sb.from('admins').select('email').order('email'); if (error) throw error; this.admins = data.map(x => x.email); this._adminsAt = Date.now(); return this.admins; },
+  async addAdmin(email) {
+    email = String(email || '').trim().toLowerCase(); if (!okEmail(email)) throw new Error('Enter a valid email.');
+    const { error } = await this.sb.from('admins').insert({ email });
+    if (error) throw new Error(error.code === '23505' ? 'That email is already an admin.' : 'Couldn’t add the admin. Try again.');
+  },
+  async removeAdmin(email) {
+    if (String(email).toLowerCase() === String(this.user?.email || '').toLowerCase()) throw new Error('You can’t remove yourself. Ask another admin to do it.');
+    const { error } = await this.sb.from('admins').delete().eq('email', email);
+    if (error) throw new Error(/at least one admin/i.test(error.message) ? 'There must always be at least one admin.' : 'Couldn’t remove the admin. Try again.');
   },
 
   /* ---------- freelancers ---------- */
+  _cleanRates(r) { const o = {}; for (const t of this.types()) { const v = r?.[t]; if (v !== undefined && v !== null && String(v).trim() !== '' && !isNaN(+v)) o[t] = Math.max(0, +v); } return o; },
+  _email(v) { const e = String(v || '').trim().toLowerCase(); if (e && !okEmail(e)) throw new Error('That email doesn’t look right.'); if (e && this.d.freelancers.some(f => f.email === e)) throw new Error('That email is already used by another freelancer.'); return e; },
   addFreelancer(input) {
     if (!input.name?.trim()) throw new Error('Name is required.');
-    const f = { id: uid(), name: input.name.trim(), description: (input.description || '').trim(), avatar: input.avatar || '', rates: { ...this.S.defaultRates }, createdAt: Date.now() };
+    const f = { id: uid(), name: input.name.trim(), description: (input.description || '').trim(), avatar: input.avatar || '', email: this._email(input.email), linked: false, rates: this._cleanRates(input.rates), createdAt: Date.now() };
     this.d.freelancers.push(f); this._saveF(f); return f;
   },
   updateFreelancer(id, patch) {
     const f = this.freelancer(id); if (!f) throw new Error('Freelancer not found.');
     if ('name' in patch && !String(patch.name).trim()) throw new Error('Name is required.');
+    if ('email' in patch) {
+      const e = String(patch.email || '').trim().toLowerCase();
+      if (e !== f.email) {
+        if (f.linked) throw new Error('This freelancer has already signed up, so their email can’t be changed here.');
+        if (e && !okEmail(e)) throw new Error('That email doesn’t look right.');
+        if (e && this.d.freelancers.some(x => x.id !== id && x.email === e)) throw new Error('That email is already used by another freelancer.');
+      }
+      patch = { ...patch, email: e };
+    }
     Object.assign(f, patch); this._saveF(f); return f;
   },
   setRates(id, rates) {
-    const f = this.freelancer(id); let n = 0; f.rates = { ...(f.rates || {}) };
-    for (const t of this.types()) { const v = Math.max(0, +rates[t] || 0); if (f.rates[t] === undefined ? v !== this.rateFor(id, t) : +f.rates[t] !== v) n++; f.rates[t] = v; }
-    this._saveF(f); return n;
+    const f = this.freelancer(id); const before = stable(f.rates || {});
+    f.rates = this._cleanRates(rates);
+    this._saveF(f); return before === stable(f.rates) ? 0 : 1;
   },
   deleteFreelancer(id) {
-    this.d.deliverables.filter(d => d.freelancerId === id).forEach(d => this.deleteDeliverable(d.id));
+    this.d.deliverables = this.d.deliverables.filter(d => d.freelancerId !== id);
     this.d.freelancers = this.d.freelancers.filter(f => f.id !== id);
-    this.persist('freelancers/' + id, null);
+    this._dirtyF.delete(id); [...this._dirtyD.values()].filter(d => d.freelancerId === id).forEach(d => this._dirtyD.delete(d.id));
+    this._delF.add(id); this._schedule();
   },
 };
