@@ -96,7 +96,7 @@ const csvCell = v => { const s = String(v ?? ''); return /[",\n\r]/.test(s) ? '"
 const toCSV = rows => rows.map(r => r.map(csvCell).join(',')).join('\r\n');
 
 /* ---------- UI state ---------- */
-const ui = { flQ: '', teamQ: '', flView: '', ws: {}, pending: false, onModalClose: null };
+const ui = { flQ: '', teamQ: '', flView: '', accBusy: '', accAct: '', ws: {}, pending: false, onModalClose: null };
 const wsState = id => ui.ws[id] || (ui.ws[id] = { tab: 'deliverables', ym: ymOf(todayISO()), q: '', sort: { k: 'assignDate', dir: -1 } });
 
 /* ---------- shell ---------- */
@@ -119,6 +119,7 @@ function route() {
     else { html = viewWorkspace(me.id); after = () => wsRefresh(me.id); }
     main.innerHTML = html; DB.onStatus(); if (after) after(); return;
   }
+  if (/[#&](access_token|error|type|code)=/.test(location.hash)) { renderSidebar('freelancers'); $('#main').innerHTML = stateScreen(); return; }   // an invitation / reset link is being processed: leave the address alone
   const [page, id] = location.hash.replace(/^#\/?/, '').split('/');
   if (page !== 'freelancers' && page !== 'settings') { location.replace('#/freelancers'); return; }
   renderSidebar(page);
@@ -134,9 +135,10 @@ function stateScreen() {
   const card = inner => `<div class="empty card login" style="margin:10vh auto 0;max-width:420px"><img src="${LOGO}" alt="" style="width:64px;height:64px;border-radius:18px;margin-bottom:14px">${inner}</div>`;
   if (DB.state === 'login') return card(`<div class="big">GFC CRM</div><p class="muted" style="margin:0 0 14px">Sign in with your email</p>
     <input class="inp" id="authEmail" type="email" placeholder="Email" autocomplete="username"><input class="inp" id="authPw" type="password" placeholder="Password" autocomplete="current-password">
+    ${DB.authNotice ? `<div class="auth-msg">${esc(DB.authNotice)}</div>` : ''}${DB.cfgIssue === 'url' ? `<div class="auth-msg">Can’t reach <b>${esc(window.GFC_CONFIG?.url || '')}</b>. Check the address in config.js: copy it again from Supabase (Copy > Project URL).</div>` : DB.cfgIssue === 'key' ? '<div class="auth-msg">Supabase rejected the key in config.js. Copy the Publishable key again from Supabase.</div>' : ''}
     <div class="auth-msg" id="authMsg" role="alert"></div><button class="btn dark lg" data-act="auth-in" style="width:100%">Sign in</button>
-    <div class="auth-links"><button class="link" data-act="auth-up">First time? Create account</button><button class="link" data-act="auth-reset">Forgot password?</button></div>`);
-  if (DB.state === 'recovery') return card(`<div class="big">Choose a new password</div><input class="inp" id="authPw" type="password" placeholder="New password (8+ characters)" autocomplete="new-password"><div class="auth-msg" id="authMsg" role="alert"></div><button class="btn dark lg" data-act="auth-newpw" style="width:100%">Save password</button>`);
+    <div class="auth-links"><span class="muted">Invited? Use the link in your email.</span><button class="link" data-act="auth-reset">Forgot password?</button></div>`);
+  if (DB.state === 'recovery' || DB.state === 'activate') return card(`<div class="big">${DB.state === 'activate' ? 'Welcome to GFC' : 'Set your password'}</div><p class="muted" style="margin:0 0 14px">${DB.state === 'activate' ? 'Choose a password to activate your account.' : 'Choose a new password for your account.'}</p><input class="inp" id="authPw" type="password" placeholder="New password (8+ characters)" autocomplete="new-password"><div class="auth-msg" id="authMsg" role="alert"></div><button class="btn dark lg" data-act="auth-newpw" style="width:100%">${DB.state === 'activate' ? 'Activate account' : 'Save password'}</button>`);
   if (DB.state === 'setup') return card(`<div class="big">Almost ready</div>This site isn’t connected to its database yet. Open <b>config.js</b> and paste your Supabase project URL and anon key (see SETUP.md).`);
   const m = {
     loading: ['Loading your workspace…', 'Fetching freelancers and deliverables.'],
@@ -144,7 +146,11 @@ function stateScreen() {
     offline: ['Sign in to use the GFC CRM', 'This CRM keeps its data online. Open this link while signed in to claude.ai with the account it was shared with.'],
     error: ['Couldn’t load the data', 'Something went wrong while connecting. Reload the page to try again.'],
   }[DB.state] || ['Loading…', ''];
-  return `<div class="empty card" style="margin:12vh auto 0;max-width:520px"><img src="${LOGO}" alt="" style="width:64px;height:64px;border-radius:18px;margin-bottom:14px"><div class="big">${m[0]}</div>${m[1]}</div>`;
+  const hint = DB.state !== 'error' || !DB.lastError ? '' : /does not exist|schema cache|column/i.test(DB.lastError) ? 'The database is missing the newest changes. In Supabase, open the SQL Editor and run <b>invite-migration.sql</b> (after schema.sql), then reload this page.'
+    : /permission|policy|row-level/i.test(DB.lastError) ? 'The database refused access. Make sure schema.sql was run, and that your email is in the admins table.'
+    : /fetch|network/i.test(DB.lastError) ? 'Can’t reach Supabase. Check your internet and the address in config.js.' : '';
+  const detail = DB.state === 'error' && DB.lastError ? `<div style="margin-top:14px;font-size:13px;color:#8a7a58">${hint ? `<p style="margin:0 0 8px;color:#2b1710">${hint}</p>` : ''}<span>Details: ${esc(DB.lastError)}</span></div>` : '';
+  return `<div class="empty card" style="margin:12vh auto 0;max-width:520px"><img src="${LOGO}" alt="" style="width:64px;height:64px;border-radius:18px;margin-bottom:14px"><div class="big">${m[0]}</div>${m[1]}${detail}</div>`;
 }
 function rerender() {
   const main = $('#main'), top = main.scrollTop, sc = $('.table-scroll', main), st = sc && [sc.scrollTop, sc.scrollLeft];
@@ -154,6 +160,27 @@ function rerender() {
 }
 
 /* ================= FREELANCERS ================= */
+const accTag = f => { const st = DB.accessStatus(f); return `<span class="acc-tag acc-${st}">${DB.ACCESS_LABEL[st]}</span>`; };
+const fmtDT = ts => ts ? new Date(ts).toLocaleString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—';
+function accessCardHtml(f) {
+  const st = DB.accessStatus(f), busy = ui.accBusy === f.id;
+  const msg = { none: 'This freelancer can’t log in yet. Send a secure invitation so they can set a password.', pending: 'The invitation was sent. They have not activated the account yet.', expired: 'The invitation link expired before it was used. Send a new one.', active: 'This freelancer can log in and sees only their own work, rates and payments.', disabled: 'This account is switched off. They can’t log in or see anything until you enable it.' }[st];
+  const btn = (act, label, cls = 'dark') => `<button class="btn ${cls}" data-act="${act}" data-id="${f.id}" ${busy ? 'disabled' : ''}>${busy && ui.accAct === act ? 'Working…' : label}</button>`;
+  const action = { none: btn('acc-invite', 'Send Invitation'), pending: btn('acc-invite', 'Resend Invitation'), expired: btn('acc-invite', 'Send New Invitation'), active: btn('acc-disable', 'Disable Account', 'danger'), disabled: btn('acc-enable', 'Enable Account') }[st];
+  return `<section class="card acc-card"><div class="card-head"><div><h3>Account access</h3><p>${msg}</p></div>${accTag(f)}</div>
+    <dl class="acc-grid"><div><dt>Login email</dt><dd>${esc(f.email) || '—'}</dd></div>
+      <div><dt>Invitation sent</dt><dd>${fmtDT(f.invitedAt)}${f.inviteCount > 1 ? ` <span class="muted">(${f.inviteCount} times)</span>` : ''}</dd></div>
+      ${f.invitedAt && !f.activatedAt ? `<div><dt>Link valid until</dt><dd>${fmtDT(f.inviteExpiresAt)}</dd></div>` : ''}
+      <div><dt>Account activated</dt><dd>${fmtDT(f.activatedAt)}</dd></div>
+      ${f.disabledAt ? `<div><dt>Disabled on</dt><dd>${fmtDT(f.disabledAt)}</dd></div>` : ''}</dl>
+    ${f.email ? '' : '<div class="note warn" style="margin-top:14px">Add this freelancer’s email first (use Edit), then send the invitation.</div>'}
+    <div class="btn-row" style="margin-top:18px">${f.email ? action : ''}</div></section>`;
+}
+async function accRun(fid, action, okMsg) {
+  ui.accBusy = fid; ui.accAct = 'acc-' + action; rerender();
+  try { await DB.accessAction(fid, action); toast(okMsg); } catch (e) { toast(e.message, 'error'); }
+  ui.accBusy = ''; rerender();
+}
 const flMode = () => ui.flView || (DB.d.freelancers.length > 12 ? 'list' : 'cards');
 const modeToggle = m => `<div class="seg" role="group" aria-label="View"><button class="${m === 'cards' ? 'on' : ''}" data-act="fl-view" data-v="cards">Cards</button><button class="${m === 'list' ? 'on' : ''}" data-act="fl-view" data-v="list">List</button></div>`;
 function viewFreelancers() {
@@ -167,7 +194,7 @@ function flGrid() {
   const q = ui.flQ.trim().toLowerCase(), m = flMode();
   const list = DB.d.freelancers.filter(f => !q || [f.name, f.description, f.email].join(' ').toLowerCase().includes(q)).sort((a, b) => a.name.localeCompare(b.name));
   if (!list.length) return `<div class="empty card" style="grid-column:1/-1"><div class="big">${DB.d.freelancers.length ? 'No freelancer matches that search' : 'No freelancers yet'}</div>${DB.d.freelancers.length ? 'Try a different search.' : 'Click “Add Freelancer” to create the first profile.'}</div>`;
-  const tag = f => `<span class="lnk-tag ${f.linked ? 'on' : ''}">${f.linked ? 'Signed up' : f.email ? 'Invite pending' : 'No login'}</span>`;
+  const tag = f => accTag(f);
   const tools = f => `<div class="fl-tools"><button class="icon-btn xs" data-act="fl-edit" data-id="${f.id}" title="Edit">${ic('edit', 15)}</button><button class="icon-btn xs danger" data-act="fl-del" data-id="${f.id}" title="Delete">${ic('trash', 15)}</button></div>`;
   if (m === 'list') return list.map(f => `<article class="fl-row" data-act="fl-open" data-id="${f.id}" tabindex="0" aria-label="Open ${esc(f.name)}">${avatar(f, 40)}<b class="c-name">${esc(f.name)}</b><span class="c-role">${esc(f.description || 'Freelancer')}</span><span class="c-mail">${esc(f.email || '')}</span>${tag(f)}${tools(f)}</article>`).join('');
   return list.map(f => `<article class="fl-card profile tone-${TONES[hashStr(f.id) % TONES.length]}" data-act="fl-open" data-id="${f.id}" tabindex="0" aria-label="Open ${esc(f.name)}">
@@ -183,22 +210,29 @@ function openFreelancerModal(id) {
       <label class="btn sm" style="cursor:pointer">${ic('image', 15)} ${f?.avatar ? 'Change photo' : 'Upload photo'}<input type="file" accept="image/*" id="avFile" hidden></label>
       <button type="button" class="btn ghost sm" id="avRm">Remove</button></div></div>
     <label>Name<input name="name" value="${esc(f?.name || '')}" required placeholder="e.g. Rahul Sharma"></label>
+    <label>Email address<input name="email" type="email" value="${esc(f?.email || '')}" placeholder="their email, used to log in" ${f?.activatedAt ? 'readonly' : ''}></label>
+    <p class="hint" style="margin:-4px 0 6px">${f?.activatedAt ? 'This freelancer has an active account.' : 'We email a secure link to this address so they can set their own password. Leave blank if they won’t log in.'}</p>
     <label>Description / role<input name="description" value="${esc(f?.description || '')}" placeholder="e.g. Video Editor | Freelancer" list="roleList"></label>
     <datalist id="roleList"><option value="Video Editor | Freelancer"><option value="Graphic Designer | Freelancer"></datalist>
     ${f ? '' : `<div class="rate-new"><b>Their rates (${esc(DB.S.currency)} per deliverable)</b><p class="hint" style="margin:2px 0 10px">Optional. You can set or change these later in the Rates tab.</p><div class="rate-grid" id="newRates">${DB.types().map(t => `<label class="rate-item"><span>${esc(t)}</span><div class="money-in"><i>${esc(DB.S.currency)}</i><input type="number" min="0" step="1" data-type="${esc(t)}" placeholder="—" aria-label="${esc(t)} rate"></div></label>`).join('')}</div></div>`}
-    <label>Login email<input name="email" type="email" value="${esc(f?.email || '')}" placeholder="their email, used to sign in" ${f?.linked ? 'readonly' : ''}></label>
-    <p class="hint" style="margin:-4px 0 6px">${f?.linked ? 'This freelancer has signed up and can see their own work and rates.' : 'They create an account on the site with this exact email and are connected automatically. Leave blank if they won’t log in.'}</p>
-  </form></div><div class="m-foot"><button class="btn" data-act="modal-close">Cancel</button><button class="btn dark" id="fSave">${f ? 'Save' : 'Add freelancer'}</button></div>`, { size: 'sm' });
+  </form></div><div class="m-foot"><button class="btn" data-act="modal-close">Cancel</button><button class="btn ${f ? 'dark' : ''}" id="fSave">${f ? 'Save' : 'Save Freelancer'}</button>${f ? '' : '<button class="btn dark" id="fSaveInvite">Save &amp; Send Invitation</button>'}</div>`, { size: 'sm' });
   const form = $('#fform', m);
   const prev = () => { $('#avPrev', m).innerHTML = avatar({ id: f?.id, name: form.elements.name.value || '?', avatar: avatarData }, 72); };
   form.elements.name.addEventListener('input', prev);
   $('#avFile', m).onchange = async e => { const file = e.target.files[0]; if (!file) return; try { avatarData = await fileToAvatar(file); prev(); } catch { toast('Could not read that image', 'error'); } };
   $('#avRm', m).onclick = () => { avatarData = ''; prev(); };
-  $('#fSave', m).onclick = () => {
+  const save = async invite => {
     const data = { name: form.elements.name.value.trim(), description: form.elements.description.value.trim(), avatar: avatarData, email: form.elements.email.value.trim() };
-    try { f ? DB.updateFreelancer(f.id, data) : DB.addFreelancer({ ...data, rates: Object.fromEntries($$('#newRates input', m).map(i => [i.dataset.type, i.value])) }); } catch (e) { return toast(e.message, 'error'); }
-    closeModal(); toast(f ? 'Saved' : `${data.name} added`); rerender();
+    if (invite && !data.email) return toast('Add their email address to send an invitation.', 'error');
+    let nf; try { nf = f ? DB.updateFreelancer(f.id, data) : DB.addFreelancer({ ...data, rates: Object.fromEntries($$('#newRates input', m).map(i => [i.dataset.type, i.value])) }); } catch (e) { return toast(e.message, 'error'); }
+    if (!invite) { closeModal(); toast(f ? 'Saved' : `${data.name} added`); rerender(); return; }
+    $$('#fSave, #fSaveInvite', m).forEach(b => b.disabled = true); $('#fSaveInvite', m).textContent = 'Sending invitation…';
+    try { await DB.accessAction(nf.id, 'invite'); closeModal(); toast(`Invitation sent to ${data.email}`); }
+    catch (e) { closeModal(); toast(`${data.name} was saved, but the invitation was not sent: ${e.message}`, 'error'); }
+    rerender();
   };
+  $('#fSave', m).onclick = () => save(false);
+  if ($('#fSaveInvite', m)) $('#fSaveInvite', m).onclick = () => save(true);
   form.addEventListener('submit', e => { e.preventDefault(); $('#fSave', m).click(); });
 }
 function fileToAvatar(file) {
@@ -229,7 +263,7 @@ function viewWorkspace(id) {
   const f = DB.freelancer(id);
   if (!f) return `<a class="back" href="#/freelancers">${ic('left', 16)} Freelancers</a><div class="empty card"><div class="big">This freelancer doesn’t exist anymore.</div></div>`;
   const s = wsState(id), tone = TONES[hashStr(f.id) % TONES.length];
-  const body = s.tab === 'rates' ? rateCardHtml(f) : `
+  const body = s.tab === 'access' && DB.role === 'owner' ? accessCardHtml(f) : s.tab === 'rates' ? rateCardHtml(f) : `
     <div class="toolbar"><span class="chip" style="background:#fff;height:38px;padding:0 12px">${ic('calendar', 15)}</span>${periodSelectors(s.ym, `data-on="ws-period" data-id="${id}"`)}
       <label class="search sm" style="background:#fff">${ic('search', 16)}<input data-on="ws-q" data-id="${id}" placeholder="Search this table" value="${esc(s.q)}" aria-label="Search deliverables"></label></div>
     <div class="kpi-row" id="wsSum" style="margin-bottom:14px"></div>
@@ -240,7 +274,7 @@ function viewWorkspace(id) {
     <div class="btn-row">${ro ? '' : `<button class="btn" data-act="fl-edit" data-id="${f.id}">${ic('edit', 16)} Edit</button>
     <button class="btn" data-act="import-open" data-id="${f.id}">${ic('upload', 16)} Import</button>`}<button class="btn" data-act="download-open" data-id="${f.id}">${ic('download', 16)} Download</button>
     ${ro ? '' : `<button class="btn dark lg" data-act="add-deliverable" data-id="${f.id}">${ic('plus', 18)} Add Deliverable</button>`}</div></section>
-  <div class="tabs">${[['deliverables', 'Deliverables'], ['rates', 'Rates']].map(([k, l]) => `<button class="${s.tab === k ? 'on' : ''}" data-act="ws-tab" data-id="${id}" data-tab="${k}">${l}</button>`).join('')}</div>
+  <div class="tabs">${[['deliverables', 'Deliverables'], ['rates', 'Rates'], ...(DB.role === 'owner' ? [['access', 'Account access']] : [])].map(([k, l]) => `<button class="${s.tab === k ? 'on' : ''}" data-act="ws-tab" data-id="${id}" data-tab="${k}">${l}</button>`).join('')}</div>
   ${body}`;
 }
 function teamGrid() {
@@ -478,6 +512,8 @@ function viewSettings() {
     <section class="card"><div class="card-head"><div><h3>Clients</h3><p>The options in every Client dropdown. Renaming a client updates its deliverables too. The number shows how many deliverables use it.</p></div></div>${listEditor('client', DB.clients())}</section>
     <section class="card"><div class="card-head"><div><h3>Deliverable types</h3><p>The options in every Type dropdown. Renaming a type updates its deliverables and rates.</p></div></div>${listEditor('type', DB.types())}</section>
   </div><div style="display:grid;gap:16px;align-content:start">
+    <section class="card"><div class="card-head"><div><h3>My account</h3><p>Signed in as <b>${esc(DB.user?.email || '')}</b></p></div></div>
+      <div class="le-add"><input class="inp" id="new-pw" type="password" placeholder="New password (8+ characters)" autocomplete="new-password" aria-label="New password"><button class="btn sm dark" data-act="pw-change">Change password</button></div></section>
     <section class="card"><div class="card-head"><div><h3>Admins</h3><p>Admins see everything, including every freelancer’s rates and payments. Each admin creates an account on the site with their own email.</p></div></div><div id="adminBox"><p class="muted">Loading…</p></div></section>
     <section class="card"><div class="card-head"><div><h3>General</h3></div></div>
       <div class="set-row"><div class="lbl"><b>Currency symbol</b><span>Shown on amounts and downloads</span></div><input class="inp" style="width:90px;text-align:center" data-on="set-currency" value="${esc(S.currency)}" maxlength="4" aria-label="Currency symbol"></div>
@@ -499,9 +535,13 @@ const ACT = {
   'auth-reset': async () => { const m = $('#authMsg'); m.className = 'auth-msg'; try { await DB.resetPassword($('#authEmail').value); m.className = 'auth-msg ok'; m.textContent = 'Password reset email sent. Check your inbox.'; } catch (e) { m.textContent = e.message; } },
   'auth-newpw': async () => { const m = $('#authMsg'); try { await DB.setPassword($('#authPw').value); } catch (e) { m.textContent = e.message; } },
   'sign-out': async () => { await DB.signOut(); },
+  'pw-change': async () => { const i = $('#new-pw'); try { await DB.changePassword(i.value); i.value = ''; toast('Password changed'); } catch (e) { toast(e.message, 'error'); } },
   'add-admin': async () => { const i = $('#new-admin'); try { await DB.addAdmin(i.value); toast('Admin added. They create an account with that email.'); refreshAdmins(true); } catch (e) { toast(e.message, 'error'); } },
   'admin-rm': async t => { const em = t.dataset.email; if (!await confirmDialog({ title: `Remove ${em} as admin?`, body: 'They will no longer see rates, payments or settings.', confirmText: 'Remove', danger: true })) return; try { await DB.removeAdmin(em); toast('Admin removed'); refreshAdmins(true); } catch (e) { toast(e.message, 'error'); } },
   'fl-view': t => { ui.flView = t.dataset.v; rerender(); },
+  'acc-invite': t => { const f = DB.freelancer(t.dataset.id); accRun(t.dataset.id, 'invite', `Invitation sent to ${f?.email}`); },
+  'acc-disable': async t => { const f = DB.freelancer(t.dataset.id); if (!await confirmDialog({ title: `Disable ${f?.name}’s account?`, body: 'They lose all access straight away and can’t sign in until you enable the account again. Their data is kept.', confirmText: 'Disable', danger: true })) return; accRun(t.dataset.id, 'disable', 'Account disabled'); },
+  'acc-enable': t => accRun(t.dataset.id, 'enable', 'Account enabled'),
   'team-open': t => { location.hash = '#/team/' + t.dataset.id; },
   'fl-open': t => { location.hash = '#/freelancers/' + t.dataset.id; },
   'ws-tab': t => { wsState(t.dataset.id).tab = t.dataset.tab; rerender(); },
@@ -579,7 +619,7 @@ document.addEventListener('change', async e => {
   }
 });
 window.addEventListener('hashchange', () => { closeModal(); route(); });
-document.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.closest?.('.login')) { e.preventDefault(); ACT[DB.state === 'recovery' ? 'auth-newpw' : 'auth-in'](); } });
+document.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.closest?.('.login')) { e.preventDefault(); ACT[DB.state === 'recovery' || DB.state === 'activate' ? 'auth-newpw' : 'auth-in'](); } });
 document.addEventListener('click', e => { if (!e.target.closest('[data-act="copy-id"]')) return; const done = () => toast('ID copied'); (navigator.clipboard?.writeText(DB.myId) || Promise.reject()).then(done, () => { const c = $('.idbox code'); if (c) { const r = document.createRange(); r.selectNodeContents(c); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); } toast('Press Ctrl+C to copy the selected ID'); }); });
 
 /* Live updates from other people redraw the page, but never under someone who is typing or has a dialog open. */
