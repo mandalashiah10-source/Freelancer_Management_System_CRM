@@ -47,39 +47,93 @@ const DB = {
   async connect() {
     const cfg = window.GFC_CONFIG || {};
     if (!cfg.url || !cfg.anonKey || /YOUR[-_]/i.test(cfg.url + cfg.anonKey) || !window.supabase) { this.state = 'setup'; this.onStatus(); return; }
+    const hp = new URLSearchParams(location.hash.slice(1)); this._linkType = hp.get('type') || '';
+    if (hp.get('error')) { this.authNotice = hp.get('error_code') === 'otp_expired' ? 'This invitation link has expired or was already used. Ask your GFC admin to send a new invitation.' : 'This link isn’t valid. Ask your GFC admin to send a new invitation.'; history.replaceState(null, '', location.pathname + location.search); }
     this.sb = window.supabase.createClient(cfg.url, cfg.anonKey, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } });
     this.sb.auth.onAuthStateChange((ev, session) => {
       setTimeout(() => {
+        if (/[#&](access_token|error|type|code)=/.test(location.hash)) history.replaceState(null, '', location.pathname + location.search);   // the link has been used up
         if (ev === 'PASSWORD_RECOVERY') { this.state = 'recovery'; this.onStatus(); return; }
         if (!session) { this._reset(); this.state = 'login'; this.onStatus(); return; }
-        if (this.state === 'recovery') return;
+        if (this.state === 'recovery' || this.state === 'activate') return;
+        if (this._linkType === 'invite' && (ev === 'SIGNED_IN' || ev === 'INITIAL_SESSION')) { this.user = session.user; this.state = 'activate'; this.onStatus(); return; }
         if (!this.user || this.user.id !== session.user.id) { this.user = session.user; this._boot(); }
       }, 0);
     });
     window.addEventListener('focus', () => this.refresh());
+    setInterval(() => this.refresh(), 60000);   // keep invitation statuses fresh
+    // Self-check: tell the user at once if the address or key in config.js is wrong.
+    if (typeof fetch === 'function') fetch(String(cfg.url).replace(/\/+$/, '') + '/auth/v1/health', { headers: { apikey: cfg.anonKey } })
+      .then(r => { this.cfgIssue = r.status === 401 || r.status === 403 ? 'key' : ''; })
+      .catch(() => { this.cfgIssue = 'url'; })
+      .finally(() => { if (this.cfgIssue) this.onChange(true); });
   },
+  cfgIssue: '', lastError: '', authNotice: '', _linkType: '',
   _reset() { this.user = null; this.role = null; this.myId = null; this.loaded = false; this.readOnly = false; this._subKey = null; this._wk = null; this.d = { settings: defaultSettings(), freelancers: [], deliverables: [], team: [], work: [] }; },
-  async signIn(email, password) { const { error } = await this.sb.auth.signInWithPassword({ email: email.trim(), password }); if (error) throw new Error(/confirm/i.test(error.message) ? 'Please confirm your email first. Check your inbox for the link.' : 'Wrong email or password.'); },
+  _niceAuth(m) {
+    m = String(m || '');
+    if (/banned|disabled/i.test(m)) return 'This account has been disabled. Contact your GFC admin.';
+    if (/not confirmed/i.test(m)) return 'Your email isn’t confirmed yet. Open the confirmation email, click the link, then sign in.';
+    if (/invalid login/i.test(m)) return 'Wrong email or password. If you haven’t created an account yet, click “First time? Create account”.';
+    if (/rate limit/i.test(m)) return 'Supabase’s free email limit is used up for now (wait about an hour). To skip email: in Supabase go to Authentication > Users > Add user > Create new user, tick Auto Confirm, then sign in here with that email and password.';
+    if (/already registered/i.test(m)) return 'This email already has an account. Sign in, or use “Forgot password?”.';
+    if (/api key|apikey|jwt/i.test(m)) return 'The Supabase key in config.js looks wrong. Copy the anon/publishable key again.';
+    if (/fetch|network|timeout|load failed/i.test(m)) return 'Can’t reach Supabase. Check your internet and the URL in config.js. If your internet provider blocks supabase.co, try a mobile hotspot or change DNS to 1.1.1.1.';
+    return m || 'Something went wrong. Try again.';
+  },
+  async signIn(email, password) {
+    if (!email.trim() || !password) throw new Error('Enter your email and password.');
+    try { const { error } = await this.sb.auth.signInWithPassword({ email: email.trim(), password }); if (error) throw error; this.authNotice = ''; this.sb.rpc('mark_activated').then(() => {}, () => {}); }
+    catch (e) { throw new Error(this._niceAuth(e.message)); }
+  },
   async signUp(email, password) {
     if (!okEmail(email.trim())) throw new Error('Enter a valid email.');
     if ((password || '').length < 8) throw new Error('Use a password of at least 8 characters.');
-    const { data, error } = await this.sb.auth.signUp({ email: email.trim(), password, options: { emailRedirectTo: location.origin + location.pathname } });
-    if (error) throw new Error(error.message);
-    return data.session ? 'in' : 'confirm';
+    try {
+      const { data, error } = await this.sb.auth.signUp({ email: email.trim(), password, options: { emailRedirectTo: location.origin + location.pathname } });
+      if (error) throw error;
+      return data.session ? 'in' : 'confirm';
+    } catch (e) { throw new Error(this._niceAuth(e.message)); }
   },
-  async resetPassword(email) { if (!okEmail(email.trim())) throw new Error('Type your email above first.'); const { error } = await this.sb.auth.resetPasswordForEmail(email.trim(), { redirectTo: location.origin + location.pathname }); if (error) throw new Error(error.message); },
+  async resetPassword(email) { if (!okEmail(email.trim())) throw new Error('Type your email above first.'); try { const { error } = await this.sb.auth.resetPasswordForEmail(email.trim(), { redirectTo: location.origin + location.pathname }); if (error) throw error; } catch (e) { throw new Error(this._niceAuth(e.message)); } },
   async setPassword(pw) {
     if ((pw || '').length < 8) throw new Error('Use a password of at least 8 characters.');
-    const { error } = await this.sb.auth.updateUser({ password: pw }); if (error) throw new Error(error.message);
+    const { error } = await this.sb.auth.updateUser({ password: pw }); if (error) throw new Error(this._niceAuth(error.message));
+    try { await this.sb.rpc('mark_activated'); } catch (e) { /* the next login marks it */ }
+    this._linkType = ''; this.authNotice = ''; history.replaceState(null, '', location.pathname + location.search);
     this.state = 'loading'; this.user = null; this.onStatus();
     const { data } = await this.sb.auth.getSession();
     if (data.session) { this.user = data.session.user; this._boot(); } else { this.state = 'login'; this.onStatus(); }
   },
+  async changePassword(pw) {
+    if ((pw || '').length < 8) throw new Error('Use a password of at least 8 characters.');
+    try { const { error } = await this.sb.auth.updateUser({ password: pw }); if (error) throw error; } catch (e) { throw new Error(this._niceAuth(e.message)); }
+  },
   async signOut() { await this.idle(); await this.sb.auth.signOut(); },
 
   /* ---------- loading ---------- */
-  _fRow(r) { const p = one(r.freelancer_private); return { id: r.id, name: r.name, description: r.description || '', avatar: r.avatar || '', userId: r.user_id, linked: !!r.user_id, email: p?.email || '', rates: p?.rates || {}, createdAt: Date.parse(r.created_at) || 0 }; },
+  _fRow(r) { const p = one(r.freelancer_private); return { id: r.id, name: r.name, description: r.description || '', avatar: r.avatar || '', userId: r.user_id, linked: !!r.user_id, email: p?.email || '', rates: p?.rates || {}, invitedAt: p?.invited_at || null, inviteExpiresAt: p?.invite_expires_at || null, activatedAt: p?.activated_at || null, disabledAt: p?.disabled_at || null, inviteCount: p?.invite_count || 0, createdAt: Date.parse(r.created_at) || 0 }; },
   _dRow(r) { const m = one(r.deliverable_money); return { id: r.id, freelancerId: r.freelancer_id, assignDate: r.assign_date, deliveryDate: r.delivery_date || '', client: r.client || '', type: r.type || '', subject: r.subject || '', status: r.status, link: r.link || '', importBatch: r.import_batch || null, createdAt: Date.parse(r.created_at) || 0, updatedAt: Date.parse(r.updated_at) || 0, paymentStatus: m?.payment_status || 'Unpaid', notes: m?.notes || '', rate: +(m?.rate ?? 0), rateSource: m?.rate_source || 'card' }; },
+  ACCESS_LABEL: { none: 'Not Invited', pending: 'Invitation Pending', expired: 'Invitation Expired', active: 'Active', disabled: 'Disabled' },
+  accessStatus(f) {
+    if (f.disabledAt) return 'disabled';
+    if (f.activatedAt) return 'active';
+    if (f.invitedAt) return Date.parse(f.inviteExpiresAt) > Date.now() ? 'pending' : 'expired';
+    return 'none';
+  },
+  /** invite | disable | enable: handled on the server (admin check, email, login), never in the browser. */
+  async accessAction(fid, action) {
+    const f = this.freelancer(fid); if (!f) throw new Error('Freelancer not found.');
+    await this.idle();                                   // save the profile (and its email) first
+    let res; try { res = await this.sb.functions.invoke('invite-freelancer', { body: { freelancerId: fid, action } }); } catch (e) { res = { error: e }; }
+    if (res.error) {
+      let msg = ''; try { msg = (await res.error.context.json()).error; } catch (e) { /* no body */ }
+      throw new Error(msg || (/fetch|network|failed to send/i.test(res.error.message || '') ? 'Can’t reach the server. Check your internet and try again.' : 'The invitation service didn’t respond. Ask the admin to check that the invite function is deployed.'));
+    }
+    const a = res.data?.access; if (!a) throw new Error(res.data?.error || 'Unexpected answer from the server.');
+    Object.assign(f, { userId: a.userId, linked: !!a.userId, invitedAt: a.invitedAt, inviteExpiresAt: a.inviteExpiresAt, activatedAt: a.activatedAt, disabledAt: a.disabledAt, inviteCount: a.inviteCount });
+    this.onChange(); return f;
+  },
   async _boot(quiet) {
     if (this._booting) return; this._booting = true;
     if (!quiet) { this.state = 'loading'; this.loaded = false; this.onStatus(); }
@@ -89,7 +143,7 @@ const DB = {
       this.role = adm.data.length ? 'owner' : 'freelancer';
       const [st, fl] = await Promise.all([
         this.sb.from('settings').select('data').eq('id', 1).maybeSingle(),
-        this.sb.from('freelancers').select('id,name,description,avatar,user_id,created_at,freelancer_private(email,rates)').order('name'),
+        this.sb.from('freelancers').select('id,name,description,avatar,user_id,created_at,freelancer_private(email,rates,invited_at,invite_expires_at,activated_at,disabled_at,invite_count)').order('name'),
       ]);
       if (st.error) throw st.error; if (fl.error) throw fl.error;
       if (!this._setDirty) this.d.settings = { ...defaultSettings(), ...(st.data?.data || {}) };
@@ -102,6 +156,7 @@ const DB = {
       this._lastLoad = Date.now(); this._subKey = null; this._wk = null;
       const first = !this.loaded; this.loaded = true; this.state = 'ok'; this.onStatus(); this.onChange(first);
     } catch (e) {
+      this.lastError = (e && (e.message || e.details)) ? String(e.message || e.details) : String(e); console.error('GFC load error:', e);
       if (!quiet) { this.state = 'error'; this.onStatus(); } else (window.toast || console.error)('Couldn’t refresh. Check your connection.', 'error');
     } finally { this._booting = false; }
   },
@@ -340,7 +395,7 @@ const DB = {
     if ('email' in patch) {
       const e = String(patch.email || '').trim().toLowerCase();
       if (e !== f.email) {
-        if (f.linked) throw new Error('This freelancer has already signed up, so their email can’t be changed here.');
+        if (f.activatedAt) throw new Error('This freelancer already has an active account, so their email can’t be changed here.');
         if (e && !okEmail(e)) throw new Error('That email doesn’t look right.');
         if (e && this.d.freelancers.some(x => x.id !== id && x.email === e)) throw new Error('That email is already used by another freelancer.');
       }
