@@ -1,8 +1,5 @@
 'use strict';
-/* ===== Spreadsheet import into one freelancer's table: Upload → Map → Review → Done =====
-   Reads .xlsx/.xls (SheetJS) and .csv, detects the header row, auto-maps columns,
-   normalises values and flags errors/duplicates. New rows are added; existing rows
-   are only overwritten when the user picks "Update" and confirms. */
+
 
 const IMPORT_FIELDS = [
   { k: 'assignDate', label: 'Assignment Date', req: true }, { k: 'deliveryDate', label: 'Delivery Date' },
