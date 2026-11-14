@@ -1,5 +1,5 @@
 'use strict';
-/* ===== GFC CRM V1 — UI layer (Freelancers + Settings) ===== */
+
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
